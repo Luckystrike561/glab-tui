@@ -2229,6 +2229,7 @@ pub async fn handle_active_tab_key(
     }
 
     if !handled {
+        let mut detail_scrolled = true;
         if app.detail_visible
             && (keybinding_matches(&app.config.keybindings.global.scroll_down, &key_event)
                 || key_event.code == KeyCode::Char('J'))
@@ -2270,6 +2271,8 @@ pub async fn handle_active_tab_key(
             // `scroll_top` jumps to the first line directly: 0 is a known
             // index, no flag round-trip needed.
             app.detail_scroll = 0;
+        } else {
+            detail_scrolled = false;
         }
 
         match key_event.code {
@@ -2885,6 +2888,9 @@ pub async fn handle_active_tab_key(
                         maybe_fetch_related_mrs(app, &tx);
                     }
                 }
+            }
+            _ if !detail_scrolled => {
+                handled = super::custom_commands::run_bound_command(app, key_event, terminal, &tx);
             }
             _ => {}
         }

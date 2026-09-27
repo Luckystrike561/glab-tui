@@ -974,6 +974,39 @@ pub struct KeybindingConfig {
     pub terminal: KeybindingTerminal,
 }
 
+/// A user-defined shell command bound to a key, in the gh-dash shape.
+/// Missing fields deserialize empty so one bad entry is reported and skipped
+/// instead of failing the whole config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomKeybinding {
+    pub key: String,
+    pub name: Option<String>,
+    pub command: String,
+    /// Run without handing over the terminal: the TUI stays on screen, the
+    /// command gets no input and its output is only kept for the log. For
+    /// commands that open their own window or pane (tmux, herdr).
+    pub background: bool,
+}
+
+/// `[[custom_keybindings.<pane>]]` tables. A separate root from
+/// `[keybindings.<pane>]` because TOML cannot make one key both a table of
+/// action bindings and an array of tables.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomKeybindingConfig {
+    pub universal: Vec<CustomKeybinding>,
+    pub issues: Vec<CustomKeybinding>,
+    /// `prs` is gh-dash's name for the same pane, so its configs port as-is.
+    #[serde(alias = "prs")]
+    pub mrs: Vec<CustomKeybinding>,
+    /// Run from the MR/PR diff view, with the file and line under the cursor.
+    pub diff: Vec<CustomKeybinding>,
+    /// Panes that take no custom keybindings, kept only to report them.
+    #[serde(flatten, skip_serializing)]
+    pub unsupported_panes: std::collections::BTreeMap<String, toml::Value>,
+}
+
 macro_rules! keybind_defaults {
     ( $( $name:ident = $val:expr ),+ $(,)? ) => {
         $(
@@ -1328,6 +1361,7 @@ pub struct Config {
     pub active_tab: Option<String>,
     pub theme: ThemeOverrides,
     pub keybindings: KeybindingConfig,
+    pub custom_keybindings: CustomKeybindingConfig,
     #[serde(default = "def_page_size")]
     pub page_size: usize,
     #[serde(default = "def_api_per_page")]
@@ -1368,6 +1402,7 @@ impl Default for Config {
             active_tab: None,
             theme: ThemeOverrides::default(),
             keybindings: KeybindingConfig::default(),
+            custom_keybindings: CustomKeybindingConfig::default(),
             page_size: def_page_size(),
             api_per_page: def_api_per_page(),
             keybinding_timeout_ms: def_keybinding_timeout_ms(),
@@ -1574,6 +1609,18 @@ toggle_wrap = "w"
 
 # [mrs]
 # columns = ["ID", "State", "Status", "Title", "Labels"]
+
+# Bind keys to your own shell commands, run through $SHELL -c (gh-dash compatible;
+# `prs` is accepted for `mrs`). Template arguments per table:
+#   mrs:       RepoName RepoPath PrNumber HeadRefName BaseRefName Author
+#   issues:    RepoName RepoPath IssueNumber IssueTitle Author
+#   universal: RepoName RepoPath
+#   diff:      mrs arguments + FilePath LineNumber (the line under the diff cursor)
+# Each is also exported as GLAB_TUI_<NAME>, e.g. GLAB_TUI_PR_NUMBER.
+# [[custom_keybindings.mrs]]
+# key = "w"
+# name = "worktree in a tmux window"
+# command = "tmux new-window -c {{{{.RepoPath}}}} 'git worktree add ../pr-{{{{.PrNumber}}}} {{{{.HeadRefName}}}}'"
 "##,
             bg = color_to_hex(theme.bg),
             border = color_to_hex(theme.border),

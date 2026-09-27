@@ -2505,6 +2505,67 @@ impl DiffView {
             })
         }
     }
+
+    /// Repo-relative path and new-side line number under the cursor, for
+    /// opening that spot in an editor. A file row in the tree gives the file's
+    /// first line; a directory row falls back to the diff cursor. A deleted
+    /// line has no new-side number, so it maps to the next surviving line of
+    /// its file (where it was removed), else the previous one; the line is
+    /// `None` only when nothing of the file survives.
+    pub fn cursor_file_position(&self) -> Option<(String, Option<u32>)> {
+        let tree_file = self
+            .focus_on_files
+            .then(|| self.visible_nodes.get(self.selected_visible_idx))
+            .flatten()
+            .and_then(|node| node.file_path.clone());
+        if let Some(path) = tree_file {
+            let line = self
+                .lines
+                .iter()
+                .filter(|line| line.file_path == path)
+                .find_map(|line| line.new_line_num);
+            return Some((path, line));
+        }
+
+        let cursor = self.layout_line(self.cursor_idx)?;
+        if let Some(number) = cursor.new_line_num {
+            return Some((cursor.file_path.clone(), Some(number)));
+        }
+        let in_cursor_file =
+            |line: &DiffLine| cursor.file_path.is_empty() || line.file_path == cursor.file_path;
+        let row_count = if self.side_by_side {
+            self.side_by_side_lines.len()
+        } else {
+            self.lines.len()
+        };
+        let nearest = (self.cursor_idx + 1..row_count)
+            .chain((0..self.cursor_idx).rev())
+            .filter_map(|idx| self.layout_line(idx))
+            .filter(|line| in_cursor_file(line))
+            .find_map(|line| {
+                line.new_line_num
+                    .map(|number| (line.file_path.clone(), number))
+            });
+        match nearest {
+            Some((path, number)) => Some((path, Some(number))),
+            None if !cursor.file_path.is_empty() => Some((cursor.file_path.clone(), None)),
+            None => None,
+        }
+    }
+
+    /// The line shown at row `idx` of the active layout; in side-by-side mode
+    /// the new-side half when it has a line number.
+    fn layout_line(&self, idx: usize) -> Option<&DiffLine> {
+        if !self.side_by_side {
+            return self.lines.get(idx);
+        }
+        let row = self.side_by_side_lines.get(idx)?;
+        match (&row.right, &row.left) {
+            (Some(right), _) if right.new_line_num.is_some() => Some(right),
+            (_, Some(left)) => Some(left),
+            (right, None) => right.as_ref(),
+        }
+    }
 }
 
 pub fn build_side_by_side_lines(lines: &[DiffLine]) -> Vec<SideBySideLine> {
@@ -3342,6 +3403,9 @@ pub struct App {
     /// that is both a prefix and a standalone binding still does its single
     /// action when the sequence lapses.
     pub standalone_chars: std::collections::HashSet<char>,
+    /// Validated `[[custom_keybindings.<pane>]]` entries, rebuilt whenever
+    /// the config is loaded.
+    pub custom_commands: crate::custom_commands::CustomCommands,
     pub active_tab: Tab,
     pub running: bool,
     pub scope: crate::scope::Scope,
@@ -3439,6 +3503,11 @@ pub struct App {
 
     pub show_help: bool,
     pub help_search_query: String,
+    /// Highlighted entry of the help list, clamped by the renderer to the
+    /// entries the current context and filter show.
+    pub help_selected: usize,
+    /// Scroll offset of the help table, kept across frames.
+    pub help_table_state: ratatui::widgets::TableState,
     pub diff_view: Option<DiffView>,
     pub review_threads: Option<ReviewThreadsOverview>,
     pub current_comments: Vec<crate::domain::mr::DiscussionNote>,
@@ -3505,6 +3574,7 @@ impl Default for App {
             pending_key: None,
             sequence_prefixes,
             standalone_chars,
+            custom_commands: crate::custom_commands::CustomCommands::default(),
             active_tab: Tab::default(),
             running: true,
             scope: crate::scope::Scope::default(),
@@ -3565,6 +3635,8 @@ impl Default for App {
 
             show_help: false,
             help_search_query: String::new(),
+            help_selected: 0,
+            help_table_state: ratatui::widgets::TableState::default(),
             diff_view: None,
             review_threads: None,
             current_comments: Vec::new(),
@@ -4221,9 +4293,8 @@ impl App {
     /// bulk/submit operation takes precedence, falling back to the most
     /// recent running command.
     pub fn show_error(&mut self, msg: String) {
-        self.error_message_at = Some(std::time::Instant::now());
         let failed_status = format!("Failed: {}", msg);
-        self.error_message = Some(msg);
+        self.raise_error_toast(msg);
         let pos = self
             .terminal_commands
             .iter()
@@ -4241,6 +4312,58 @@ impl App {
             });
         if let Some(pos) = pos {
             self.terminal_commands[pos].status = failed_status;
+        }
+    }
+
+    /// Shows the error toast without marking any terminal entry failed, for
+    /// failures already recorded with `record_command_outcome`.
+    pub fn raise_error_toast(&mut self, msg: String) {
+        self.error_message_at = Some(std::time::Instant::now());
+        self.error_message = Some(msg);
+    }
+
+    /// Appends a finished command to the terminal log. A failure also raises
+    /// the error toast; unlike `show_error`, the entry it marks failed is
+    /// this one rather than whichever command is still running.
+    pub fn log_command_outcome(&mut self, command: String, outcome: Result<(), String>) {
+        self.record_command_outcome(command, &outcome);
+        if let Err(error) = outcome {
+            self.raise_error_toast(error);
+        }
+    }
+
+    /// Appends a finished command to the terminal log without a toast.
+    pub fn record_command_outcome(&mut self, command: String, outcome: &Result<(), String>) {
+        let status = match outcome {
+            Ok(()) => "Success".to_string(),
+            Err(error) => format!("Failed: {error}"),
+        };
+        self.terminal_commands.push(TerminalCommand {
+            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            command,
+            status,
+        });
+    }
+
+    /// Rebuilds `custom_commands` from the current config, logging every
+    /// ignored or shadowed entry in the terminal log.
+    pub fn load_custom_commands(&mut self) {
+        let (commands, problems) = crate::custom_commands::CustomCommands::load(&self.config);
+        self.standalone_chars.extend(commands.character_keys());
+        self.custom_commands = commands;
+        let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+        for problem in &problems {
+            self.terminal_commands.push(TerminalCommand {
+                timestamp: timestamp.clone(),
+                command: format!("Custom keybinding: {}", problem.binding),
+                status: format!("Failed: {}", problem.problem),
+            });
+        }
+        if !problems.is_empty() {
+            self.raise_error_toast(format!(
+                "{} custom keybinding problem(s); see the Terminal tab",
+                problems.len()
+            ));
         }
     }
 
@@ -4382,6 +4505,7 @@ impl App {
             }
         }
         app.apply_config();
+        app.load_custom_commands();
         app
     }
 
@@ -8081,6 +8205,130 @@ index abcdef..ffffff 100644
         assert_eq!(
             side_by_side[3].right.as_ref().unwrap().content,
             " normal line"
+        );
+    }
+
+    const CURSOR_POSITION_DIFF: &str = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,4 +10,4 @@
+ context ten
+-removed eleven
++added eleven
+ context twelve
+diff --git a/src/gone.rs b/src/gone.rs
+deleted file mode 100644
+--- a/src/gone.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-gone one
+-gone two
+";
+
+    fn diff_row(view: &DiffView, content: &str) -> usize {
+        view.lines
+            .iter()
+            .position(|line| line.content == content)
+            .unwrap_or_else(|| panic!("no diff row {content:?}"))
+    }
+
+    #[test]
+    fn cursor_file_position_uses_the_new_side_line_under_the_cursor() {
+        let mut view = DiffView::new(1, "o/r".to_string(), CURSOR_POSITION_DIFF.to_string());
+        view.focus_on_files = false;
+
+        view.cursor_idx = diff_row(&view, "+added eleven");
+        assert_eq!(
+            view.cursor_file_position(),
+            Some(("src/lib.rs".to_string(), Some(11)))
+        );
+        view.cursor_idx = diff_row(&view, " context twelve");
+        assert_eq!(
+            view.cursor_file_position(),
+            Some(("src/lib.rs".to_string(), Some(12)))
+        );
+    }
+
+    /// A removed line no longer exists in the checkout; the editor should
+    /// land where it was, i.e. on the next line that survived.
+    #[test]
+    fn cursor_file_position_maps_a_removed_line_to_where_it_was() {
+        let mut view = DiffView::new(1, "o/r".to_string(), CURSOR_POSITION_DIFF.to_string());
+        view.focus_on_files = false;
+
+        view.cursor_idx = diff_row(&view, "-removed eleven");
+        assert_eq!(
+            view.cursor_file_position(),
+            Some(("src/lib.rs".to_string(), Some(11)))
+        );
+    }
+
+    #[test]
+    fn cursor_file_position_has_no_line_in_a_deleted_file() {
+        let mut view = DiffView::new(1, "o/r".to_string(), CURSOR_POSITION_DIFF.to_string());
+        view.focus_on_files = false;
+
+        view.cursor_idx = diff_row(&view, "-gone two");
+        assert_eq!(
+            view.cursor_file_position(),
+            Some(("src/gone.rs".to_string(), None)),
+            "must not borrow a line number from src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn cursor_file_position_follows_the_new_side_in_side_by_side_mode() {
+        let mut view = DiffView::new(1, "o/r".to_string(), CURSOR_POSITION_DIFF.to_string());
+        view.focus_on_files = false;
+        view.side_by_side = true;
+        view.update_active_lines();
+
+        view.cursor_idx = view
+            .side_by_side_lines
+            .iter()
+            .position(|row| {
+                row.left
+                    .as_ref()
+                    .is_some_and(|line| line.content == "-removed eleven")
+            })
+            .unwrap();
+        assert_eq!(
+            view.cursor_file_position(),
+            Some(("src/lib.rs".to_string(), Some(11)))
+        );
+    }
+
+    #[test]
+    fn cursor_file_position_on_a_tree_row_opens_the_file_at_its_first_line() {
+        let mut view = DiffView::new(1, "o/r".to_string(), CURSOR_POSITION_DIFF.to_string());
+        view.focus_on_files = true;
+        view.selected_visible_idx = view
+            .visible_nodes
+            .iter()
+            .position(|node| node.file_path.as_deref() == Some("src/lib.rs"))
+            .unwrap();
+
+        assert_eq!(
+            view.cursor_file_position(),
+            Some(("src/lib.rs".to_string(), Some(10)))
+        );
+    }
+
+    #[test]
+    fn cursor_file_position_on_a_directory_row_uses_the_diff_cursor() {
+        let mut view = DiffView::new(1, "o/r".to_string(), CURSOR_POSITION_DIFF.to_string());
+        view.focus_on_files = true;
+        view.selected_visible_idx = view
+            .visible_nodes
+            .iter()
+            .position(|node| node.is_dir)
+            .unwrap();
+        view.cursor_idx = diff_row(&view, " context twelve");
+
+        assert_eq!(
+            view.cursor_file_position(),
+            Some(("src/lib.rs".to_string(), Some(12)))
         );
     }
 
