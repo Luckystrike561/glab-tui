@@ -70,8 +70,11 @@ fn execute(
     terminal: &mut AppTerminal,
     tx: &UnboundedSender<Event>,
 ) {
-    let targets = match targets(app, command.pane) {
-        Ok(targets) => targets,
+    let Selection {
+        targets,
+        missing_rows,
+    } = match targets(app, command.pane) {
+        Ok(selection) => selection,
         Err(reason) => {
             app.log_command_outcome(
                 format!("Custom command: {}", command.command),
@@ -80,9 +83,20 @@ fn execute(
             return;
         }
     };
-    let total = targets.len();
+    let total = targets.len() + missing_rows.len();
 
     let mut refused: Vec<String> = Vec::new();
+    for row in missing_rows {
+        let reason = format!(
+            "\"{}\" not run for {row}: it is no longer loaded",
+            command.label()
+        );
+        app.record_command_outcome(
+            format!("Custom command: {}", command.command),
+            &Err(reason.clone()),
+        );
+        refused.push(reason);
+    }
     let mut runs: Vec<(String, TemplateValues)> = Vec::new();
     for target in targets {
         match render(&command.command, &target.values) {
@@ -183,70 +197,100 @@ fn on_row(row: &str) -> String {
 /// Characters of a failing command's last stderr line kept for the log.
 const MAX_ERROR_DETAIL_CHARS: usize = 200;
 
-/// Runs `process`, keeping its stderr so a failure can name its cause: in a
-/// terminal handoff the redraw wipes the screen, in the background nothing is
-/// shown at all.
+/// How long a background run's stderr is still read after the command
+/// exits; a descendant it left running may hold the pipe open indefinitely.
+const STDERR_DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Runs `process` to completion. A terminal run inherits every stream, so
+/// shells stay interactive and tools see a tty; its failure reports the exit
+/// status. A background run keeps its stderr so a failure names its cause.
 fn run_process(
     command: &CustomCommand,
     process: &mut std::process::Command,
     handoff: Handoff,
 ) -> Result<(), String> {
-    if handoff == Handoff::Background {
-        // The TUI owns the screen and the keyboard.
-        process
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null());
-    }
-    let mut child = process
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "\"{}\" could not start {:?}: {error}",
-                command.label(),
-                process.get_program()
-            )
-        })?;
-    let stderr = child
-        .stderr
-        .take()
-        .map(|stderr| collect_stderr(stderr, handoff == Handoff::Terminal));
-    let status = child.wait();
-    let captured = stderr
-        .and_then(|reader| reader.join().ok())
-        .unwrap_or_default();
+    let (status, stderr) = match handoff {
+        Handoff::Terminal => (process.status(), Vec::new()),
+        Handoff::Background => {
+            process
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped());
+            detach_from_terminal(process);
+            match process.spawn() {
+                Ok(mut child) => {
+                    let chunks = child.stderr.take().map(stream_stderr);
+                    let status = child.wait();
+                    (status, chunks.map(drain_stderr).unwrap_or_default())
+                }
+                Err(error) => (Err(error), Vec::new()),
+            }
+        }
+    };
     match status {
         Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(match last_error_line(&captured) {
+        Ok(status) => Err(match last_error_line(&stderr) {
             Some(detail) => format!("\"{}\" failed with {status}: {detail}", command.label()),
             None => format!("\"{}\" failed with {status}", command.label()),
         }),
-        Err(error) => Err(format!("\"{}\" did not finish: {error}", command.label())),
+        Err(error) => Err(format!(
+            "\"{}\" could not start {:?}: {error}",
+            command.label(),
+            process.get_program()
+        )),
     }
 }
 
-/// Collects `stderr`, also copying it to the real terminal when `show`.
-fn collect_stderr(
-    mut stderr: std::process::ChildStderr,
-    show: bool,
-) -> std::thread::JoinHandle<Vec<u8>> {
+/// Forwards `stderr` chunk by chunk from a reader thread.
+fn stream_stderr(mut stderr: std::process::ChildStderr) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        use std::io::{Read, Write};
-        let mut captured = Vec::new();
+        use std::io::Read;
         let mut buffer = [0u8; 4096];
-        let mut terminal = std::io::stderr();
         while let Ok(read) = stderr.read(&mut buffer) {
-            if read == 0 {
+            if read == 0 || sender.send(buffer[..read].to_vec()).is_err() {
                 break;
             }
-            if show {
-                let _ = terminal.write_all(&buffer[..read]);
-            }
-            captured.extend_from_slice(&buffer[..read]);
         }
-        captured
-    })
+    });
+    receiver
 }
+
+/// Collects what `chunks` delivers until the pipe closes or
+/// `STDERR_DRAIN_AFTER_EXIT` passes.
+fn drain_stderr(chunks: std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + STDERR_DRAIN_AFTER_EXIT;
+    let mut stderr = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match chunks.recv_timeout(remaining) {
+            Ok(chunk) => stderr.extend_from_slice(&chunk),
+            Err(_) => return stderr,
+        }
+    }
+}
+
+/// Starts `process` in a new session without a controlling terminal. Tools
+/// built on Go's termenv (lazyworktree, gh) open /dev/tty even with every
+/// stdio redirected and query the background colour; the terminal's reply
+/// then arrives as keypresses in the TUI (`r` of `rgb:` reopening an issue).
+#[cfg(unix)]
+fn detach_from_terminal(process: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the hook only calls setsid(2), which is async-signal-safe and
+    // touches no memory shared with the parent.
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_from_terminal(_process: &mut std::process::Command) {}
 
 /// Last non-blank line of `output`, without control characters.
 fn last_error_line(output: &[u8]) -> Option<String> {
@@ -261,22 +305,35 @@ fn last_error_line(output: &[u8]) -> Option<String> {
     Some(cleaned)
 }
 
+/// Local checkout per project, looked up once per keypress: in group scope
+/// each lookup runs git once per recent repository.
+type CheckoutCache = std::collections::HashMap<String, Result<String, String>>;
+
+/// What one keypress acts on, plus the selected rows that are no longer
+/// loaded and so are skipped.
+struct Selection {
+    targets: Vec<Target>,
+    missing_rows: Vec<String>,
+}
+
 /// What a command acts on: every selected issue or MR/PR when there is a
 /// selection (bulk run), otherwise the highlighted row, the diff cursor, or
 /// the repository for a universal command.
-fn targets(app: &App, pane: CommandPane) -> Result<Vec<Target>, String> {
-    match pane {
+fn targets(app: &App, pane: CommandPane) -> Result<Selection, String> {
+    let mut checkouts = CheckoutCache::new();
+    let mut missing_rows = Vec::new();
+    let targets = match pane {
         CommandPane::Universal => {
             let mut values = TemplateValues::default();
             let project = app
                 .scope
                 .is_repository()
                 .then(|| app.scope.as_str().to_string());
-            insert_repo_values(&mut values, app, project);
-            Ok(vec![Target {
+            insert_repo_values(&mut values, app, project, &mut checkouts);
+            vec![Target {
                 row: String::new(),
                 values,
-            }])
+            }]
         }
         CommandPane::Issues => {
             let issues: Vec<&crate::domain::issues::Issue> = if app.selected_issues.is_empty() {
@@ -288,7 +345,7 @@ fn targets(app: &App, pane: CommandPane) -> Result<Vec<Target>, String> {
                     .ok_or_else(|| "no issue is selected".to_string())?;
                 vec![issue]
             } else {
-                let mut selected: Vec<_> = app
+                let loaded: Vec<_> = app
                     .issues
                     .items
                     .iter()
@@ -297,16 +354,20 @@ fn targets(app: &App, pane: CommandPane) -> Result<Vec<Target>, String> {
                             .contains(&(i.project_path.clone(), i.iid))
                     })
                     .collect();
-                selected.sort_by(|a, b| (&a.project_path, a.iid).cmp(&(&b.project_path, b.iid)));
-                selected
+                missing_rows = unloaded_rows(
+                    &app.selected_issues,
+                    loaded.iter().map(|i| (i.project_path.as_str(), i.iid)),
+                    "#",
+                );
+                sorted_by_project_and_number(loaded, |i| (i.project_path.as_str(), i.iid))
             };
             if issues.is_empty() {
                 return Err("the selected issues are no longer loaded".to_string());
             }
-            Ok(issues
+            issues
                 .into_iter()
-                .map(|issue| issue_target(app, issue))
-                .collect())
+                .map(|issue| issue_target(app, issue, &mut checkouts))
+                .collect()
         }
         CommandPane::MergeRequests => {
             let mrs: Vec<&crate::domain::mr::MergeRequest> = if app.selected_mrs.is_empty() {
@@ -318,14 +379,18 @@ fn targets(app: &App, pane: CommandPane) -> Result<Vec<Target>, String> {
                     .ok_or_else(|| format!("no {} is selected", app.kind().term("mr_short")))?;
                 vec![mr]
             } else {
-                let mut selected: Vec<_> = app
+                let loaded: Vec<_> = app
                     .mrs
                     .items
                     .iter()
                     .filter(|m| app.selected_mrs.contains(&(m.project_path.clone(), m.iid)))
                     .collect();
-                selected.sort_by(|a, b| (&a.project_path, a.iid).cmp(&(&b.project_path, b.iid)));
-                selected
+                missing_rows = unloaded_rows(
+                    &app.selected_mrs,
+                    loaded.iter().map(|m| (m.project_path.as_str(), m.iid)),
+                    mr_row_prefix(app),
+                );
+                sorted_by_project_and_number(loaded, |m| (m.project_path.as_str(), m.iid))
             };
             if mrs.is_empty() {
                 return Err(format!(
@@ -333,42 +398,87 @@ fn targets(app: &App, pane: CommandPane) -> Result<Vec<Target>, String> {
                     app.kind().term("mr_plural")
                 ));
             }
-            Ok(mrs.into_iter().map(|mr| mr_target(app, mr)).collect())
+            mrs.into_iter()
+                .map(|mr| mr_target(app, mr, &mut checkouts))
+                .collect()
         }
-        CommandPane::Diff => Ok(vec![Target {
+        CommandPane::Diff => vec![Target {
             row: String::new(),
-            values: diff_values(app)?,
-        }]),
-    }
+            values: diff_values(app, &mut checkouts)?,
+        }],
+    };
+    Ok(Selection {
+        targets,
+        missing_rows,
+    })
 }
 
-fn issue_target(app: &App, issue: &crate::domain::issues::Issue) -> Target {
+fn sorted_by_project_and_number<'a, T>(
+    mut rows: Vec<&'a T>,
+    key: impl Fn(&T) -> (&str, u64),
+) -> Vec<&'a T> {
+    rows.sort_by(|a, b| key(a).cmp(&key(b)));
+    rows
+}
+
+/// Selected `(project, number)` keys with no loaded row, as `#12` / `!12`.
+fn unloaded_rows<'a>(
+    selected: &std::collections::HashSet<(String, u64)>,
+    loaded: impl Iterator<Item = (&'a str, u64)>,
+    prefix: &str,
+) -> Vec<String> {
+    let loaded: std::collections::HashSet<(&str, u64)> = loaded.collect();
+    let mut missing: Vec<&(String, u64)> = selected
+        .iter()
+        .filter(|(project, number)| !loaded.contains(&(project.as_str(), *number)))
+        .collect();
+    missing.sort();
+    missing
+        .into_iter()
+        .map(|(_, number)| format!("{prefix}{number}"))
+        .collect()
+}
+
+/// GitHub numbers pull requests like issues (`#12`); GitLab uses `!12`.
+fn mr_row_prefix(app: &App) -> &'static str {
+    if app.is_github() { "#" } else { "!" }
+}
+
+fn issue_target(
+    app: &App,
+    issue: &crate::domain::issues::Issue,
+    checkouts: &mut CheckoutCache,
+) -> Target {
     let mut values = TemplateValues::default();
     values.insert("IssueNumber", issue.iid.to_string());
     values.insert("IssueTitle", issue.title.clone());
     values.insert("Author", issue.author.username.clone());
     let project = row_project(&issue.project_path, Some(&issue.web_url), &app.scope);
-    insert_repo_values(&mut values, app, project);
+    insert_repo_values(&mut values, app, project, checkouts);
     Target {
         row: format!("#{}", issue.iid),
         values,
     }
 }
 
-fn mr_target(app: &App, mr: &crate::domain::mr::MergeRequest) -> Target {
+fn mr_target(
+    app: &App,
+    mr: &crate::domain::mr::MergeRequest,
+    checkouts: &mut CheckoutCache,
+) -> Target {
     let mut values = TemplateValues::default();
     insert_mr_values(&mut values, mr);
     let project = row_project(&mr.project_path, mr.web_url.as_deref(), &app.scope);
-    insert_repo_values(&mut values, app, project);
+    insert_repo_values(&mut values, app, project, checkouts);
     Target {
-        row: format!("!{}", mr.iid),
+        row: format!("{}{}", mr_row_prefix(app), mr.iid),
         values,
     }
 }
 
 /// Values for a diff-view command: the open MR/PR plus the file and line
 /// under the cursor.
-fn diff_values(app: &App) -> Result<TemplateValues, String> {
+fn diff_values(app: &App, checkouts: &mut CheckoutCache) -> Result<TemplateValues, String> {
     let mut values = TemplateValues::default();
     let diff_view = app
         .diff_view
@@ -413,16 +523,24 @@ fn diff_values(app: &App) -> Result<TemplateValues, String> {
     } else {
         Some(diff_view.project_path.clone())
     };
-    insert_repo_values(&mut values, app, project);
+    insert_repo_values(&mut values, app, project, checkouts);
     Ok(values)
 }
 
-fn insert_repo_values(values: &mut TemplateValues, app: &App, project: Option<String>) {
+fn insert_repo_values(
+    values: &mut TemplateValues,
+    app: &App,
+    project: Option<String>,
+    checkouts: &mut CheckoutCache,
+) {
     match project {
         Some(project) => {
-            match local_checkout(&app.scope, &project) {
-                Ok(path) => values.insert("RepoPath", path),
-                Err(reason) => values.insert_unavailable("RepoPath", reason),
+            let checkout = checkouts
+                .entry(project.clone())
+                .or_insert_with(|| local_checkout(&app.scope, &project));
+            match checkout {
+                Ok(path) => values.insert("RepoPath", path.clone()),
+                Err(reason) => values.insert_unavailable("RepoPath", reason.clone()),
             }
             values.insert("RepoName", project);
         }
@@ -486,9 +604,9 @@ mod tests {
 
     /// The values of a command that acts on exactly one target.
     fn single_values(app: &App, pane: CommandPane) -> Result<TemplateValues, String> {
-        let mut targets = targets(app, pane)?;
-        assert_eq!(targets.len(), 1, "expected a single target");
-        Ok(targets.remove(0).values)
+        let mut selection = targets(app, pane)?;
+        assert_eq!(selection.targets.len(), 1, "expected a single target");
+        Ok(selection.targets.remove(0).values)
     }
 
     #[test]
@@ -520,6 +638,50 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn background_process_runs_in_its_own_session() {
+        let mut process = std::process::Command::new("sleep");
+        process.arg("1");
+        detach_from_terminal(&mut process);
+        let mut child = process.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+
+        let session = unsafe { libc::getsid(pid) };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            session, pid,
+            "the child must lead a new session, detached from the tty"
+        );
+    }
+
+    /// A descendant that keeps stderr open (`tool &`, a daemon) must not hold
+    /// the report back until it exits.
+    #[test]
+    fn background_run_does_not_wait_for_descendants_holding_stderr() {
+        let command = CustomCommand {
+            pane: CommandPane::Universal,
+            key: "X".to_string(),
+            name: None,
+            command: String::new(),
+            background: true,
+            shadowed_on: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        let outcome = run_process(
+            &command,
+            &mut shell_process("sleep 5 & echo 'boom' >&2; exit 1"),
+            Handoff::Background,
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(outcome.unwrap_err().ends_with(": boom"));
+    }
+
     #[test]
     fn selected_issues_each_get_a_run_in_number_order() {
         let mut app = App::default();
@@ -530,7 +692,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let targets = targets(&app, CommandPane::Issues).unwrap();
+        let targets = targets(&app, CommandPane::Issues).unwrap().targets;
         let rendered: Vec<String> = targets
             .iter()
             .map(|target| render("wt {{.IssueNumber}}", &target.values).unwrap())
@@ -556,6 +718,15 @@ mod tests {
         assert_eq!(
             targets(&app, CommandPane::Issues).err(),
             Some("the selected issues are no longer loaded".to_string())
+        );
+
+        app.selected_issues.insert((String::new(), 1));
+        let selection = targets(&app, CommandPane::Issues).unwrap();
+        assert_eq!(selection.targets.len(), 1);
+        assert_eq!(
+            selection.missing_rows,
+            vec!["#99"],
+            "vanished rows are reported"
         );
     }
 

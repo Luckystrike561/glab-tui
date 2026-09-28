@@ -348,7 +348,7 @@ name = "lazygit"
 command = "cd {{.RepoPath}} && lazygit"
 ```
 
-A commented set of ready-to-copy bindings (worktrees with `lazyworktree`, Neovim at the diff line, lazygit, bulk runs) lives in [`examples/custom-keybindings.toml`](examples/custom-keybindings.toml).
+A commented set of ready-to-copy bindings (worktrees with `lazyworktree`, Neovim at the diff line, lazygit, bulk runs) lives in [`examples/custom-keybindings.toml`](examples/custom-keybindings.toml). Try it without touching your config: `glab-tui --config examples/custom-keybindings.toml`.
 
 | Table | Template arguments |
 |---|---|
@@ -357,7 +357,7 @@ A commented set of ready-to-copy bindings (worktrees with `lazyworktree`, Neovim
 | `custom_keybindings.universal` | `RepoName`, `RepoPath` |
 | `custom_keybindings.diff` (diff view) | `RepoName`, `RepoPath`, `PrNumber`, `HeadRefName`, `BaseRefName`, `Author`, `FilePath`, `LineNumber` |
 
-- The command runs through `$SHELL -c` (falling back to `sh`, or `cmd /C` on Windows) with the terminal handed over until it exits, then the TUI comes back. Every run is logged in the Terminal tab; a non-zero exit also raises an error toast quoting the command's last stderr line (e.g. `lazyworktree` refusing a closed issue), since the TUI redraw hides the terminal output.
+- The command runs through `$SHELL -c` (falling back to `sh`, or `cmd /C` on Windows) with the terminal handed over until it exits, then the TUI comes back. Every run is logged in the Terminal tab; a non-zero exit also raises an error toast. While a command has the terminal, Ctrl+C stops the command, not glab-tui.
 - `diff` bindings run from the MR/PR diff view (`D`). `FilePath` is repo-relative and `LineNumber` is the new-side line under the cursor; a removed line maps to where it was, a file-tree row to the file's first changed line. For example, to open that spot in a worktree of the PR branch:
 
   ```toml
@@ -366,11 +366,11 @@ A commented set of ready-to-copy bindings (worktrees with `lazyworktree`, Neovim
   name = "open in nvim (worktree)"
   command = "lazyworktree create --from-pr {{.PrNumber}} --update-on-existing --exec 'nvim +{{.LineNumber}} {{.FilePath}}'"
   ```
-- `background = true` runs the command without handing over the terminal: the TUI stays on screen, the command gets no input, its output is not shown, and the Terminal tab logs it when it finishes (a failure toasts its last stderr line). Use it for commands that open their own window or pane, such as `tmux new-window` or `herdr pane split`.
+- `background = true` runs the command without handing over the terminal: the TUI stays on screen, the command gets no input, its output is not shown, and the Terminal tab logs it when it finishes; a failure toasts its last stderr line (e.g. `lazyworktree` refusing a closed issue). Use it for commands that open their own window or pane, such as `tmux new-window` or `herdr pane split`. Background commands run in their own session without a controlling terminal, so tools that query the terminal through `/dev/tty` (lazyworktree, gh) cannot inject the reply into glab-tui as keypresses. Place new herdr panes with `--pane "$HERDR_PANE_ID"` (glab-tui's own pane): `--current` follows whichever pane is focused in the herdr UI.
 - **Bulk runs:** with issues or MRs/PRs selected (`Space`, or `v` select mode), an `issues`/`mrs` binding runs once per selected item, in number order, within a single terminal handoff — e.g. one worktree per selected issue. A failing or refused item does not stop the others; each run is logged and one toast summarises the failures.
 - Row arguments come from the highlighted issue or MR/PR. `RepoPath` is the local checkout: the repository glab-tui runs in (it follows the `Ctrl+S` switcher), or in group scope the recently used checkout whose `origin` is the row's project.
-- Every argument is also exported as an environment variable: `GLAB_TUI_REPO_NAME`, `GLAB_TUI_REPO_PATH`, `GLAB_TUI_PR_NUMBER`, `GLAB_TUI_HEAD_REF_NAME`, `GLAB_TUI_BASE_REF_NAME`, `GLAB_TUI_AUTHOR`, `GLAB_TUI_ISSUE_NUMBER`, `GLAB_TUI_ISSUE_TITLE`. A `{{.Arg}}` whose value contains a shell metacharacter (`` ` `` `$` `;` `&` `|` `<` `>` `(` `)` `\` `"` `'` or a control character) is refused rather than spliced into the command; quote the variable instead, e.g. `echo "$GLAB_TUI_ISSUE_TITLE"`.
-- Built-in keys always win. In the diff view that includes every key it handles, whatever the modifier (`Ctrl+d` counts as `d`). A custom key that a built-in action (including the fixed keys such as `j`, `q`, `u`, `f`) takes first is reported in the Terminal tab at startup; remap the built-in under `[keybindings.<pane>]` to free the key. A pane-specific binding overrides a universal one on the same key.
+- Every argument is also exported as an environment variable: `GLAB_TUI_REPO_NAME`, `GLAB_TUI_REPO_PATH`, `GLAB_TUI_PR_NUMBER`, `GLAB_TUI_HEAD_REF_NAME`, `GLAB_TUI_BASE_REF_NAME`, `GLAB_TUI_AUTHOR`, `GLAB_TUI_ISSUE_NUMBER`, `GLAB_TUI_ISSUE_TITLE`, `GLAB_TUI_FILE_PATH`, `GLAB_TUI_LINE_NUMBER`. A `{{.Arg}}` whose value contains a shell metacharacter (`` ` `` `$` `;` `&` `|` `<` `>` `(` `)` `\` `"` `'` or a control character) is refused rather than spliced into the command; quote the variable instead, e.g. `echo "$GLAB_TUI_ISSUE_TITLE"`.
+- Built-in keys always win. Several fixed keys (`q`, `j`/`k`/`h`/`l`, `?`, `,`, Enter, Esc, and in the diff view every key it handles) are taken whatever the modifier, so `Ctrl+q` or `Ctrl+d` counts as taken. `J`/`K` and PageUp/PageDown are reported as taken even though they only scroll while the detail pane is open. A custom key that a built-in action (including the fixed keys such as `j`, `q`, `u`, `f`) takes first is reported in the Terminal tab at startup; remap the built-in under `[keybindings.<pane>]` to free the key. A pane-specific binding overrides a universal one on the same key.
 - Invalid entries (missing `key` or `command`, an unbindable key, an argument the table does not offer, an unsupported table) are skipped and reported the same way instead of breaking the rest of the config. A repo-local `config.toml` that defines a table replaces the global list for that table.
 
 ---
@@ -396,6 +396,7 @@ glab-tui --tab pipelines
 | `-r`, `--repo` | `owner/repo` | Launch glab-tui for a custom remote repository |
 | `-g`, `--group` | `group` | Launch glab-tui for a GitLab group or GitHub organization context |
 | `-d`, `--dir` | `/path/to/dir` | Launch glab-tui in a custom repository directory |
+| `-c`, `--config` | `/path/to/config.toml` | Use this config file instead of `~/.config/glab-tui/config.toml` (a repo-local `.glab-tui/config.toml` still applies on top); `Save View → Global` rewrites that file without its comments |
 | `-t`, `--tab` | `issues\|mrs\|pr\|pipelines\|jobs\|runners\|releases\|todos\|milestones\|branches\|environments\|terminal` | Tab to open on launch (overrides `active_tab` in `config.toml`) |
 | `-u`, `--update` | | Check for and install updates |
 | `-h`, `--help` | | Print usage help details |

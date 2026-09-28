@@ -253,3 +253,110 @@ command = "echo 'herdr: no pane w9:p99' >&2; exit 2"
         .wait_for_screen_contains("herdr: no pane w9:p99", 10000)
         .expect("a background failure should toast its stderr reason");
 }
+
+#[test]
+fn test_config_flag_loads_the_given_file_instead_of_the_global_config() {
+    let sandbox = crate::Sandbox::new(false).unwrap();
+    let global_dir = sandbox.config_dir.join("glab-tui");
+    std::fs::create_dir_all(&global_dir).unwrap();
+    std::fs::write(
+        global_dir.join("config.toml"),
+        "[[custom_keybindings.universal]]\nkey = \"x\"\ncommand = \"touch from_global\"\n",
+    )
+    .unwrap();
+    let flag_config = sandbox.temp_dir.path().join("workflow.toml");
+    std::fs::write(
+        &flag_config,
+        "[[custom_keybindings.universal]]\nkey = \"x\"\ncommand = \"touch from_flag\"\n",
+    )
+    .unwrap();
+
+    let envs = sandbox.envs();
+    let envs: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let pty = crate::Pty::spawn(
+        crate::find_glab_tui_binary().to_str().unwrap(),
+        &["--config", flag_config.to_str().unwrap()],
+        &envs,
+        40,
+        160,
+        Some(&sandbox.repo_dir),
+    )
+    .unwrap();
+    let mut session = TestSession {
+        sandbox,
+        pty,
+        emulator: crate::TerminalEmulator::new(40, 160),
+    };
+    session
+        .wait_for_screen_contains("Issues", 30000)
+        .expect("app should start with --config");
+
+    let ran = session.sandbox.repo_dir.join("from_flag");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ran.exists() {
+        assert!(Instant::now() < deadline, "the --config binding should run");
+        session.send_input(b"x");
+        pump_output(&mut session, Duration::from_millis(300));
+    }
+    assert!(
+        !session.sandbox.repo_dir.join("from_global").exists(),
+        "the global config must not be loaded"
+    );
+}
+
+/// Tools that open /dev/tty to query the terminal (lazyworktree, gh) would
+/// get the reply delivered to glab-tui as keypresses.
+#[test]
+fn test_background_command_cannot_reach_the_terminal() {
+    let mut session = session_on_mrs_tab(
+        r#"
+[[custom_keybindings.universal]]
+key = "x"
+background = true
+command = "touch ran; exec 3<>/dev/tty && touch tty_reachable"
+"#,
+    );
+
+    session.send_input(b"x");
+
+    wait_for_file_to_exist(&session.sandbox.repo_dir.join("ran"));
+    pump_output(&mut session, Duration::from_millis(500));
+    assert!(
+        !session.sandbox.repo_dir.join("tty_reachable").exists(),
+        "a background command must not be able to open /dev/tty"
+    );
+}
+
+fn wait_for_file_to_exist(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} was never created",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// With the terminal handed over, Ctrl+C belongs to the command: it must stop
+/// the command, not glab-tui.
+#[test]
+fn test_ctrl_c_in_a_foreground_command_does_not_kill_glab_tui() {
+    let mut session = session_on_mrs_tab(
+        r#"
+[[custom_keybindings.universal]]
+key = "x"
+command = "touch waiting; sleep 30"
+"#,
+    );
+
+    session.send_input(b"x");
+    wait_for_file_to_exist(&session.sandbox.repo_dir.join("waiting"));
+    pump_output(&mut session, Duration::from_millis(300));
+    session.send_input(b"\x03");
+
+    session
+        .wait_for_screen_contains(MR_TITLE, 10000)
+        .expect("glab-tui should survive Ctrl+C and redraw");
+}

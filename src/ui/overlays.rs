@@ -2050,8 +2050,7 @@ pub(crate) fn render_help(f: &mut Frame, app: &mut App, size: Rect) {
             action: "Show this help modal",
         },
     ];
-    // The help table does not scroll, so the few user-defined commands go
-    // first rather than below the long built-in lists.
+    // The few user-defined commands go first, above the long built-in lists.
     shortcuts.splice(
         0..0,
         custom_commands.iter().map(|command| Shortcut {

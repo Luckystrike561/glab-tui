@@ -11,51 +11,63 @@ use std::sync::RwLock;
 #[cfg(test)]
 pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// RAII guard that swaps `HOME` and `USERPROFILE` to a test-owned tempdir
-/// for the duration of a scope. The cache layer reads both, so any test
-/// that triggers a cache write (`add_recent_repo`, `add_recent_group`,
-/// direct `fs::write` to `get_recent_repos_file_path()`, …) must isolate
-/// the cache dir from the user's real `~/.cache/glab-tui/` or risk
-/// clobbering it. On drop (including panic) the previous values are
-/// restored. Always pair with `TEST_ENV_MUTEX` so tests do not race each
-/// other's env swaps.
+/// RAII guard that points every location variable glab-tui reads (`HOME`,
+/// `USERPROFILE`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `GLAB_TUI_CONFIG`) at a
+/// test-owned tempdir for the duration of a scope. `XDG_CONFIG_HOME` wins over
+/// `HOME` for the config file, so redirecting `HOME` alone lets a test that
+/// saves the config overwrite the user's real `config.toml`. On drop
+/// (including panic) the previous values are restored. Always pair with
+/// `TEST_ENV_MUTEX` so tests do not race each other's env swaps.
 #[cfg(test)]
 pub(crate) struct EnvGuard {
-    old_home: Option<String>,
-    old_profile: Option<String>,
+    previous: Vec<(&'static str, Option<String>)>,
 }
 
 #[cfg(test)]
 impl EnvGuard {
-    /// Set both `HOME` and `USERPROFILE` to `new_home`, saving the
-    /// previous values for restoration on drop.
     pub(crate) fn isolate_home(new_home: &std::path::Path) -> Self {
-        let new_home_str = new_home.to_string_lossy().into_owned();
-        let old_home = std::env::var("HOME").ok();
-        let old_profile = std::env::var("USERPROFILE").ok();
-        unsafe {
-            std::env::set_var("HOME", &new_home_str);
-            std::env::set_var("USERPROFILE", &new_home_str);
+        let home = new_home.to_string_lossy().into_owned();
+        let values: [(&'static str, Option<String>); 5] = [
+            ("HOME", Some(home.clone())),
+            ("USERPROFILE", Some(home)),
+            (
+                "XDG_CONFIG_HOME",
+                Some(new_home.join(".config").to_string_lossy().into_owned()),
+            ),
+            (
+                "XDG_CACHE_HOME",
+                Some(new_home.join(".cache").to_string_lossy().into_owned()),
+            ),
+            ("GLAB_TUI_CONFIG", None),
+        ];
+        let previous = values
+            .iter()
+            .map(|(name, _)| (*name, std::env::var(name).ok()))
+            .collect();
+        for (name, value) in values {
+            set_or_remove_env(name, value.as_deref());
         }
-        Self {
-            old_home,
-            old_profile,
-        }
+        Self { previous }
     }
 }
 
 #[cfg(test)]
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        unsafe {
-            match &self.old_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.old_profile {
-                Some(v) => std::env::set_var("USERPROFILE", v),
-                None => std::env::remove_var("USERPROFILE"),
-            }
+        for (name, value) in &self.previous {
+            set_or_remove_env(name, value.as_deref());
+        }
+    }
+}
+
+#[cfg(test)]
+fn set_or_remove_env(name: &str, value: Option<&str>) {
+    // SAFETY: callers hold TEST_ENV_MUTEX, so no other test thread reads or
+    // writes the environment meanwhile.
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
         }
     }
 }
@@ -544,6 +556,61 @@ pub(crate) fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
+/// Deep-merges `overrides` into `base`: tables merge key by key, any other
+/// value (including an array of tables) replaces the base value.
+fn merge_toml_values(base: &mut toml::Value, overrides: toml::Value) {
+    match (base, overrides) {
+        (toml::Value::Table(base_table), toml::Value::Table(overrides_table)) => {
+            for (key, val) in overrides_table {
+                match base_table.entry(key) {
+                    toml::map::Entry::Occupied(mut entry) => {
+                        merge_toml_values(entry.get_mut(), val);
+                    }
+                    toml::map::Entry::Vacant(entry) => {
+                        entry.insert(val);
+                    }
+                }
+            }
+        }
+        (base, overrides) => {
+            *base = overrides;
+        }
+    }
+}
+
+/// Renames gh-dash's `custom_keybindings.prs` table to `mrs` in one parsed
+/// file, appending to `mrs` when the file has both. Done per file before
+/// merging, because a merged value holding both keys is a duplicate field for
+/// the serde alias and would fail the whole config.
+fn normalize_custom_keybindings(file: &mut toml::Value) {
+    let Some(tables) = file
+        .get_mut("custom_keybindings")
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
+    };
+    let Some(prs) = tables.remove("prs") else {
+        return;
+    };
+    match (tables.get_mut("mrs"), prs) {
+        (Some(toml::Value::Array(mrs)), toml::Value::Array(prs)) => mrs.extend(prs),
+        (Some(_), _) => {}
+        (None, prs) => {
+            tables.insert("mrs".to_string(), prs);
+        }
+    }
+}
+
+/// Config file chosen with `--config`, set once at startup before any config
+/// is loaded.
+static CONFIG_FILE_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Makes every config load and global save use `file` for this process.
+/// Themes still live in the default config directory.
+pub fn use_config_file(file: PathBuf) {
+    let _ = CONFIG_FILE_OVERRIDE.set(file);
+}
+
 fn config_dir() -> PathBuf {
     if let Ok(path) = std::env::var("GLAB_TUI_CONFIG") {
         let mut p = PathBuf::from(path);
@@ -975,8 +1042,8 @@ pub struct KeybindingConfig {
 }
 
 /// A user-defined shell command bound to a key, in the gh-dash shape.
-/// Missing fields deserialize empty so one bad entry is reported and skipped
-/// instead of failing the whole config.
+/// Missing fields deserialize empty so the entry is reported and skipped
+/// instead of failing the whole config; a wrongly typed field still does.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CustomKeybinding {
@@ -1427,6 +1494,9 @@ impl Default for Config {
 
 impl Config {
     pub fn config_path() -> PathBuf {
+        if let Some(file) = CONFIG_FILE_OVERRIDE.get() {
+            return file.clone();
+        }
         let mut path = config_dir();
         let _ = std::fs::create_dir_all(&path);
         path.push("config.toml");
@@ -1652,7 +1722,8 @@ toggle_wrap = "w"
 
         let path = Self::config_path();
         if let Ok(global_contents) = std::fs::read_to_string(&path) {
-            if let Ok(global_val) = toml::from_str::<toml::Value>(&global_contents) {
+            if let Ok(mut global_val) = toml::from_str::<toml::Value>(&global_contents) {
+                normalize_custom_keybindings(&mut global_val);
                 merge_toml_values(&mut merged_value, global_val);
             }
         }
@@ -1679,32 +1750,13 @@ toggle_wrap = "w"
             for p in &paths {
                 if p.exists() {
                     if let Ok(workspace_contents) = std::fs::read_to_string(p) {
-                        if let Ok(workspace_val) =
+                        if let Ok(mut workspace_val) =
                             toml::from_str::<toml::Value>(&workspace_contents)
                         {
+                            normalize_custom_keybindings(&mut workspace_val);
                             merge_toml_values(&mut merged_value, workspace_val);
                         }
                     }
-                }
-            }
-        }
-
-        fn merge_toml_values(base: &mut toml::Value, overrides: toml::Value) {
-            match (base, overrides) {
-                (toml::Value::Table(base_table), toml::Value::Table(overrides_table)) => {
-                    for (key, val) in overrides_table {
-                        match base_table.entry(key) {
-                            toml::map::Entry::Occupied(mut entry) => {
-                                merge_toml_values(entry.get_mut(), val);
-                            }
-                            toml::map::Entry::Vacant(entry) => {
-                                entry.insert(val);
-                            }
-                        }
-                    }
-                }
-                (base, overrides) => {
-                    *base = overrides;
                 }
             }
         }
@@ -1777,26 +1829,8 @@ impl Config {
 
         let path = Self::config_path();
         if let Ok(global_contents) = std::fs::read_to_string(&path) {
-            if let Ok(global_val) = toml::from_str::<toml::Value>(&global_contents) {
-                fn merge_toml_values(base: &mut toml::Value, overrides: toml::Value) {
-                    match (base, overrides) {
-                        (toml::Value::Table(base_table), toml::Value::Table(overrides_table)) => {
-                            for (key, val) in overrides_table {
-                                match base_table.entry(key) {
-                                    toml::map::Entry::Occupied(mut entry) => {
-                                        merge_toml_values(entry.get_mut(), val);
-                                    }
-                                    toml::map::Entry::Vacant(entry) => {
-                                        entry.insert(val);
-                                    }
-                                }
-                            }
-                        }
-                        (base, overrides) => {
-                            *base = overrides;
-                        }
-                    }
-                }
+            if let Ok(mut global_val) = toml::from_str::<toml::Value>(&global_contents) {
+                normalize_custom_keybindings(&mut global_val);
                 merge_toml_values(&mut merged_value, global_val);
             }
         }
@@ -2230,6 +2264,36 @@ page_size = 250
         }
         assert_eq!(home_dir(), temp_dir.path());
         drop(guard);
+    }
+
+    /// A global file written for gh-dash (`prs`) and a repo-local file using
+    /// `mrs` must merge like any other table instead of failing the config.
+    #[test]
+    fn prs_and_mrs_tables_from_two_files_merge_as_one_pane() {
+        let mut global: toml::Value = toml::from_str(
+            "theme_preset = \"nord\"\n[[custom_keybindings.prs]]\nkey = \"w\"\ncommand = \"global\"\n",
+        )
+        .unwrap();
+        let mut local: toml::Value =
+            toml::from_str("[[custom_keybindings.mrs]]\nkey = \"w\"\ncommand = \"local\"\n")
+                .unwrap();
+        normalize_custom_keybindings(&mut global);
+        normalize_custom_keybindings(&mut local);
+        merge_toml_values(&mut global, local);
+
+        let config = Config::deserialize(global).expect("merged config deserializes");
+        assert_eq!(config.theme_preset.as_deref(), Some("nord"));
+        let commands: Vec<&str> = config
+            .custom_keybindings
+            .mrs
+            .iter()
+            .map(|binding| binding.command.as_str())
+            .collect();
+        assert_eq!(
+            commands,
+            vec!["local"],
+            "the repo-local table replaces the global one"
+        );
     }
 
     #[test]

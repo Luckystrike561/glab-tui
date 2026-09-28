@@ -4349,6 +4349,8 @@ impl App {
     /// ignored or shadowed entry in the terminal log.
     pub fn load_custom_commands(&mut self) {
         let (commands, problems) = crate::custom_commands::CustomCommands::load(&self.config);
+        let (_, standalone_chars) = keybinding_char_sets(&self.config.keybindings);
+        self.standalone_chars = standalone_chars;
         self.standalone_chars.extend(commands.character_keys());
         self.custom_commands = commands;
         let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();

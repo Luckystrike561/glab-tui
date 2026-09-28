@@ -691,6 +691,21 @@ async fn main() -> Result<()> {
     // ── Subcommand dispatch ──
     let cli = cli::Cli::parse();
 
+    if let Some(ref path) = cli.config {
+        // Resolved before `--dir` changes the working directory.
+        match std::fs::canonicalize(path) {
+            Ok(file) if file.is_file() => crate::config::use_config_file(file),
+            Ok(_) => {
+                eprintln!("Error: --config '{}' is not a file", path.display());
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: --config '{}': {}", path.display(), e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     if let Some(cmd) = cli.command {
         match cmd {
             cli::Commands::Doctor => {

@@ -77,7 +77,10 @@ pub fn suspend_while<T>(
     crate::event::PAUSED.store(true, std::sync::atomic::Ordering::Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let result = leave_tui().map(|()| foreground());
+    let result = leave_tui().map(|()| {
+        let _interrupts = InterruptGuard::install();
+        foreground()
+    });
 
     // Restore terminal for the TUI. Each operation is best-effort: even if one
     // fails we attempt the next — all three are independent raw-mode gates.
@@ -98,6 +101,59 @@ pub fn suspend_while<T>(
     result
 }
 
+/// Keeps Ctrl+C and Ctrl+\ from killing the TUI while a foreground child
+/// has the terminal: leaving raw mode re-enables ISIG, and the TUI shares the
+/// child's process group. A no-op handler rather than SIG_IGN, because exec
+/// resets handlers to the default, so the child still gets the signal.
+#[cfg(unix)]
+struct InterruptGuard {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+#[cfg(unix)]
+impl InterruptGuard {
+    fn install() -> Self {
+        extern "C" fn ignore(_: libc::c_int) {}
+        let mut previous = Vec::new();
+        for signal in [libc::SIGINT, libc::SIGQUIT] {
+            // SAFETY: both structs are fully initialised before use, and the
+            // handler does nothing, so it is async-signal-safe.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as usize;
+                libc::sigemptyset(&mut action.sa_mask);
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(signal, &action, &mut old) == 0 {
+                    previous.push((signal, old));
+                }
+            }
+        }
+        Self { previous }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        for (signal, old) in &self.previous {
+            // SAFETY: restores a disposition previously returned by sigaction.
+            unsafe {
+                libc::sigaction(*signal, old, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct InterruptGuard;
+
+#[cfg(not(unix))]
+impl InterruptGuard {
+    fn install() -> Self {
+        Self
+    }
+}
+
 fn leave_tui() -> std::io::Result<()> {
     crossterm::terminal::disable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -106,5 +162,6 @@ fn leave_tui() -> std::io::Result<()> {
         stdout,
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::event::DisableMouseCapture,
+        crossterm::cursor::Show,
     )
 }
