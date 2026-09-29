@@ -5,7 +5,7 @@
 //!
 //! The mock `glab` serves `tests/fixtures/mrs.json` for `mr list`, whose one
 //! MR is !2 `feature/pagination` → `main` by `test-user`, and
-//! `custom_command_diff.txt` for `mr diff`. The harness pins
+//! `mr_diff.txt` for `mr diff`. The harness pins
 //! `SHELL=/bin/sh` so commands run under a known shell.
 
 use crate::TestSession;
@@ -160,12 +160,13 @@ command = "printf '%s:%s %s' {{{{.FilePath}}}} {{{{.LineNumber}}}} {{{{.HeadRefN
     let mut session = session_on_mrs_tab(&config);
     session.send_input(b"D");
     session
-        .wait_for_screen_contains("src/pagination.rs", 15000)
-        .expect("D should open the MR diff with the fixture file");
+        .wait_for_screen_contains("Merge Request Diff #2", 15000)
+        .expect("D should open the MR diff");
 
-    // Focus the diff pane and search; Esc leaves search with the cursor on
-    // the match, the added line (new-side line 41).
-    for key in b"\t/MAX_ROWS_QUIRK\x1b" {
+    // Select `src/pagination.rs` (below `docs/`, `readme.md`, `src/` and
+    // `lib.rs`), focus the diff pane and search; Esc leaves search with the
+    // cursor on the match, the added line (new-side line 41).
+    for key in b"jjjj\t/MAX_ROWS_QUIRK\x1b" {
         session.send_input(&[*key]);
         pump_output(&mut session, Duration::from_millis(150));
     }
