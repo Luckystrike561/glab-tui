@@ -1,5 +1,5 @@
 use crate::AppTerminal;
-use crate::app::App;
+use crate::app::{App, CUSTOM_COMMAND_LOG_PREFIX};
 use crate::custom_commands::{CommandPane, CustomCommand, TemplateValues, render, shell_process};
 use crate::event::Event;
 use crate::scope::Scope;
@@ -53,6 +53,9 @@ pub struct RunReport {
     refused: Vec<String>,
     /// Rendered command and outcome of each run, in order.
     runs: Vec<(String, Result<(), String>)>,
+    /// Terminal-log rows shown as running while a background run works,
+    /// one per run in the same order; empty for terminal runs.
+    log_rows: Vec<usize>,
 }
 
 /// Where a command's stderr goes while it runs.
@@ -77,7 +80,7 @@ fn execute(
         Ok(selection) => selection,
         Err(reason) => {
             app.log_command_outcome(
-                format!("Custom command: {}", command.command),
+                format!("{CUSTOM_COMMAND_LOG_PREFIX}{}", command.command),
                 Err(format!("\"{}\" not run: {reason}", command.label())),
             );
             return;
@@ -92,7 +95,7 @@ fn execute(
             command.label()
         );
         app.record_command_outcome(
-            format!("Custom command: {}", command.command),
+            format!("{CUSTOM_COMMAND_LOG_PREFIX}{}", command.command),
             &Err(reason.clone()),
         );
         refused.push(reason);
@@ -108,7 +111,7 @@ fn execute(
                     on_row(&target.row)
                 );
                 app.record_command_outcome(
-                    format!("Custom command: {}", command.command),
+                    format!("{CUSTOM_COMMAND_LOG_PREFIX}{}", command.command),
                     &Err(reason.clone()),
                 );
                 refused.push(reason);
@@ -121,6 +124,7 @@ fn execute(
         total,
         refused,
         runs: Vec::new(),
+        log_rows: Vec::new(),
     };
     if runs.is_empty() {
         report_runs(app, report);
@@ -128,6 +132,12 @@ fn execute(
     }
 
     if command.background {
+        report.log_rows = runs
+            .iter()
+            .map(|(rendered, _)| {
+                app.start_command(format!("{CUSTOM_COMMAND_LOG_PREFIX}{rendered}"))
+            })
+            .collect();
         let command = command.clone();
         let tx = tx.clone();
         std::thread::spawn(move || {
@@ -157,6 +167,11 @@ fn run_all(
 ) -> Vec<(String, Result<(), String>)> {
     runs.into_iter()
         .map(|(rendered, values)| {
+            if handoff == Handoff::Terminal {
+                // The TUI is off screen while a terminal run works; a command
+                // that prints nothing would otherwise leave a blank screen.
+                eprintln!("glab-tui: running \"{}\": {rendered}", command.label());
+            }
             let mut process = shell_process(&rendered);
             process.envs(values.environment());
             let outcome = run_process(command, &mut process, handoff);
@@ -168,8 +183,12 @@ fn run_all(
 /// Logs every run of a keypress and raises one toast for its failures.
 pub fn report_runs(app: &mut App, report: RunReport) {
     let mut failures = report.refused;
-    for (rendered, outcome) in report.runs {
-        app.record_command_outcome(format!("Custom command: {rendered}"), &outcome);
+    for (index, (rendered, outcome)) in report.runs.into_iter().enumerate() {
+        match report.log_rows.get(index) {
+            Some(&row) => app.settle_command(row, &outcome),
+            None => app
+                .record_command_outcome(format!("{CUSTOM_COMMAND_LOG_PREFIX}{rendered}"), &outcome),
+        }
         if let Err(reason) = outcome {
             failures.push(reason);
         }

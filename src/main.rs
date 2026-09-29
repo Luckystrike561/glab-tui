@@ -1870,11 +1870,7 @@ async fn main() -> Result<()> {
                         .rposition(|cmd| cmd.command == command && cmd.status == "Running")
                     {
                         app.terminal_commands[pos].status = status;
-                    } else if let Some(pos) = app
-                        .terminal_commands
-                        .iter()
-                        .rposition(|cmd| cmd.status == "Running")
-                    {
+                    } else if let Some(pos) = app.latest_running_cli_command() {
                         // fallback: update most recent Running entry when
                         // command strings differ (e.g. CommandStarted vs backend log)
                         app.terminal_commands[pos].status = status;
@@ -1901,11 +1897,7 @@ async fn main() -> Result<()> {
                 Event::CommandCompleted(tab, res) => {
                     match &res {
                         Ok(_) => {
-                            if let Some(pos) = app
-                                .terminal_commands
-                                .iter()
-                                .rposition(|cmd| cmd.status == "Running")
-                            {
+                            if let Some(pos) = app.latest_running_cli_command() {
                                 app.terminal_commands[pos].status = "Success".to_string();
                             }
                         }

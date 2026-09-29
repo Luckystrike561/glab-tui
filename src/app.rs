@@ -2862,6 +2862,9 @@ impl DatePicker {
     }
 }
 
+/// Prefix of every terminal-log entry written for a custom keybinding.
+pub const CUSTOM_COMMAND_LOG_PREFIX: &str = "Custom command: ";
+
 #[derive(Debug, Clone)]
 pub struct TerminalCommand {
     pub timestamp: String,
@@ -4304,12 +4307,9 @@ impl App {
                     || cmd.command.contains("submit")
                     || cmd.command.contains("bulk"))
                     && cmd.status == "Running"
+                    && !cmd.command.starts_with(CUSTOM_COMMAND_LOG_PREFIX)
             })
-            .or_else(|| {
-                self.terminal_commands
-                    .iter()
-                    .rposition(|cmd| cmd.status == "Running")
-            });
+            .or_else(|| self.latest_running_cli_command());
         if let Some(pos) = pos {
             self.terminal_commands[pos].status = failed_status;
         }
@@ -4334,15 +4334,38 @@ impl App {
 
     /// Appends a finished command to the terminal log without a toast.
     pub fn record_command_outcome(&mut self, command: String, outcome: &Result<(), String>) {
-        let status = match outcome {
-            Ok(()) => "Success".to_string(),
-            Err(error) => format!("Failed: {error}"),
-        };
+        let row = self.start_command(command);
+        self.settle_command(row, outcome);
+    }
+
+    /// Appends a command still running to the terminal log and returns its
+    /// row for `settle_command`. The log is append-only, so the row stays valid.
+    pub fn start_command(&mut self, command: String) -> usize {
         self.terminal_commands.push(TerminalCommand {
             timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
             command,
-            status,
+            status: "Running".to_string(),
         });
+        self.terminal_commands.len() - 1
+    }
+
+    /// Stamps the outcome on a row returned by `start_command`.
+    pub fn settle_command(&mut self, row: usize, outcome: &Result<(), String>) {
+        if let Some(entry) = self.terminal_commands.get_mut(row) {
+            entry.status = match outcome {
+                Ok(()) => "Success".to_string(),
+                Err(error) => format!("Failed: {error}"),
+            };
+        }
+    }
+
+    /// Most recent running entry started by the `glab`/`gh` event plumbing.
+    /// Custom commands are skipped: they settle their own row by index, and
+    /// an unrelated completion must not stamp a background command finished.
+    pub fn latest_running_cli_command(&self) -> Option<usize> {
+        self.terminal_commands.iter().rposition(|cmd| {
+            cmd.status == "Running" && !cmd.command.starts_with(CUSTOM_COMMAND_LOG_PREFIX)
+        })
     }
 
     /// Rebuilds `custom_commands` from the current config, logging every

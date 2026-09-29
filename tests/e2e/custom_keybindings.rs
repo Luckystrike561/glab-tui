@@ -256,6 +256,37 @@ command = "echo 'herdr: no pane w9:p99' >&2; exit 2"
 }
 
 #[test]
+fn test_background_custom_command_shows_running_until_it_finishes() {
+    let mut session = session_on_mrs_tab(
+        r#"
+[[custom_keybindings.universal]]
+key = "x"
+background = true
+command = "while [ ! -f gate ]; do sleep 0.05; done; touch finished"
+"#,
+    );
+    pump_output(&mut session, Duration::from_millis(500));
+    assert!(
+        !session.emulator.get_text().contains("RUNNING"),
+        "nothing should be running before the key is pressed"
+    );
+
+    session.send_input(b"x");
+    session
+        .wait_for_screen_contains("RUNNING", 5000)
+        .expect("a slow background command should show as running");
+
+    std::fs::write(session.sandbox.repo_dir.join("gate"), "").unwrap();
+    wait_for_file_to_exist(&session.sandbox.repo_dir.join("finished"));
+    pump_output(&mut session, Duration::from_millis(1000));
+    let screen = session.emulator.get_text();
+    assert!(
+        !screen.contains("RUNNING"),
+        "the running entry should settle once the command exits:\n{screen}"
+    );
+}
+
+#[test]
 fn test_config_flag_loads_the_given_file_instead_of_the_global_config() {
     let sandbox = crate::Sandbox::new(false).unwrap();
     let global_dir = sandbox.config_dir.join("glab-tui");
