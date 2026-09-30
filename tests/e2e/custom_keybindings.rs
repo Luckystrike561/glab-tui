@@ -29,7 +29,14 @@ fn session_on_mrs_tab(config_toml: &str) -> TestSession {
     session
 }
 
-fn wait_for_file(path: &Path, timeout_ms: u64) -> Result<String, String> {
+/// Waits for `path` to hold content while feeding the app's output to the
+/// emulator: an undrained PTY fills up (quickly on macOS) and blocks the app
+/// mid-redraw, before it ever handles the key under test.
+fn wait_for_file(
+    session: &mut TestSession,
+    path: &Path,
+    timeout_ms: u64,
+) -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while Instant::now() < deadline {
         if let Ok(content) = std::fs::read_to_string(path) {
@@ -37,7 +44,7 @@ fn wait_for_file(path: &Path, timeout_ms: u64) -> Result<String, String> {
                 return Ok(content);
             }
         }
-        std::thread::sleep(Duration::from_millis(20));
+        pump_output(session, Duration::from_millis(20));
     }
     Err(format!("{} was never written", path.display()))
 }
@@ -52,12 +59,12 @@ name = "record pr"
 command = "printf '%s|%s|%s|%s|%s|%s' {{{{.PrNumber}}}} {{{{.HeadRefName}}}} {{{{.BaseRefName}}}} {{{{.Author}}}} {{{{.RepoName}}}} \"$GLAB_TUI_PR_NUMBER\" > {{{{.RepoPath}}}}/{OUTPUT_FILE}"
 "#
     );
-    let session = session_on_mrs_tab(&config);
+    let mut session = session_on_mrs_tab(&config);
     let output_path = session.sandbox.repo_dir.join(OUTPUT_FILE);
 
     session.send_input(b"w");
 
-    let output = wait_for_file(&output_path, 10000)
+    let output = wait_for_file(&mut session, &output_path, 10000)
         .expect("the command should write into the repo checkout ({{.RepoPath}})");
     assert_eq!(output, EXPECTED_ROW_FIELDS);
 
@@ -71,10 +78,10 @@ command = "printf '%s|%s|%s|%s|%s|%s' {{{{.PrNumber}}}} {{{{.HeadRefName}}}} {{{
             "keypresses should reach the app again once the command has exited"
         );
         session.send_input(b"w");
-        std::thread::sleep(Duration::from_millis(300));
+        pump_output(&mut session, Duration::from_millis(300));
     }
     assert_eq!(
-        wait_for_file(&output_path, 5000).unwrap(),
+        wait_for_file(&mut session, &output_path, 5000).unwrap(),
         EXPECTED_ROW_FIELDS
     );
 }
@@ -173,7 +180,8 @@ command = "printf '%s:%s %s' {{{{.FilePath}}}} {{{{.LineNumber}}}} {{{{.HeadRefN
     pump_output(&mut session, Duration::from_millis(300));
     session.send_input(b"o");
 
-    let output = wait_for_file(&session.sandbox.repo_dir.join(OUTPUT_FILE), 10000)
+    let output_path = session.sandbox.repo_dir.join(OUTPUT_FILE);
+    let output = wait_for_file(&mut session, &output_path, 10000)
         .expect("the diff binding should run from the diff view");
     assert_eq!(output, "src/pagination.rs:41 feature/pagination");
 }
@@ -245,7 +253,8 @@ command = "echo 'herdr: no pane w9:p99' >&2; exit 2"
     let mut session = session_on_mrs_tab(&config);
 
     session.send_input(b"w");
-    let output = wait_for_file(&session.sandbox.repo_dir.join(OUTPUT_FILE), 10000)
+    let output_path = session.sandbox.repo_dir.join(OUTPUT_FILE);
+    let output = wait_for_file(&mut session, &output_path, 10000)
         .expect("the background command should run");
     assert_eq!(output, "2");
 
@@ -277,7 +286,8 @@ command = "while [ ! -f gate ]; do sleep 0.05; done; touch finished"
         .expect("a slow background command should show as running");
 
     std::fs::write(session.sandbox.repo_dir.join("gate"), "").unwrap();
-    wait_for_file_to_exist(&session.sandbox.repo_dir.join("finished"));
+    let finished = session.sandbox.repo_dir.join("finished");
+    wait_for_file_to_exist(&mut session, &finished);
     pump_output(&mut session, Duration::from_millis(1000));
     let screen = session.emulator.get_text();
     assert!(
@@ -351,7 +361,8 @@ command = "touch ran; exec 3<>/dev/tty && touch tty_reachable"
 
     session.send_input(b"x");
 
-    wait_for_file_to_exist(&session.sandbox.repo_dir.join("ran"));
+    let ran = session.sandbox.repo_dir.join("ran");
+    wait_for_file_to_exist(&mut session, &ran);
     pump_output(&mut session, Duration::from_millis(500));
     assert!(
         !session.sandbox.repo_dir.join("tty_reachable").exists(),
@@ -359,7 +370,7 @@ command = "touch ran; exec 3<>/dev/tty && touch tty_reachable"
     );
 }
 
-fn wait_for_file_to_exist(path: &Path) {
+fn wait_for_file_to_exist(session: &mut TestSession, path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !path.exists() {
         assert!(
@@ -367,7 +378,7 @@ fn wait_for_file_to_exist(path: &Path) {
             "{} was never created",
             path.display()
         );
-        std::thread::sleep(Duration::from_millis(20));
+        pump_output(session, Duration::from_millis(20));
     }
 }
 
@@ -384,7 +395,8 @@ command = "touch waiting; sleep 30"
     );
 
     session.send_input(b"x");
-    wait_for_file_to_exist(&session.sandbox.repo_dir.join("waiting"));
+    let waiting = session.sandbox.repo_dir.join("waiting");
+    wait_for_file_to_exist(&mut session, &waiting);
     pump_output(&mut session, Duration::from_millis(300));
     session.send_input(b"\x03");
 
