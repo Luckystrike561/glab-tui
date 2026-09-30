@@ -628,6 +628,7 @@ mod tests {
         Ok(selection.targets.remove(0).values)
     }
 
+    #[cfg(unix)]
     #[test]
     fn failing_command_reports_its_last_stderr_line() {
         let command = CustomCommand {
@@ -677,6 +678,7 @@ mod tests {
 
     /// A descendant that keeps stderr open (`tool &`, a daemon) must not hold
     /// the report back until it exits.
+    #[cfg(unix)]
     #[test]
     fn background_run_does_not_wait_for_descendants_holding_stderr() {
         let command = CustomCommand {
