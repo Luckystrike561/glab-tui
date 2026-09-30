@@ -45,6 +45,8 @@ pub enum Event {
     JobsTabFetched(u64, Vec<crate::domain::pipelines::Job>),
     CommandStarted(String),
     CommandCompleted(crate::app::Tab, Result<(), String>),
+    /// A background custom command finished all its runs.
+    CustomCommandFinished(crate::handlers::custom_commands::RunReport),
     TerminalCommandLogged {
         timestamp: String,
         command: String,

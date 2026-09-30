@@ -6,6 +6,7 @@ mod app;
 mod backend;
 mod cli;
 mod config;
+mod custom_commands;
 mod domain;
 mod editor;
 mod entity_editor;
@@ -218,6 +219,7 @@ fn handle_mouse_event(app: &mut App, mouse_event: &crossterm::event::MouseEvent)
                         return;
                     }
                     OverlayKind::Help => {
+                        handlers::overlays::move_help_selection(app, scroll_down, 1);
                         return;
                     }
                     OverlayKind::Configure => {
@@ -688,6 +690,21 @@ async fn main() -> Result<()> {
 
     // ── Subcommand dispatch ──
     let cli = cli::Cli::parse();
+
+    if let Some(ref path) = cli.config {
+        // Resolved before `--dir` changes the working directory.
+        match std::fs::canonicalize(path) {
+            Ok(file) if file.is_file() => crate::config::use_config_file(file),
+            Ok(_) => {
+                eprintln!("Error: --config '{}' is not a file", path.display());
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: --config '{}': {}", path.display(), e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     if let Some(cmd) = cli.command {
         match cmd {
@@ -1828,6 +1845,9 @@ async fn main() -> Result<()> {
                         app.terminal_commands[pos].status = "Success".to_string();
                     }
                 }
+                Event::CustomCommandFinished(report) => {
+                    handlers::custom_commands::report_runs(&mut app, report);
+                }
                 Event::DiffFetchFailed(err_msg) => {
                     app.diff_loading = false;
                     app.show_error(err_msg);
@@ -1850,11 +1870,7 @@ async fn main() -> Result<()> {
                         .rposition(|cmd| cmd.command == command && cmd.status == "Running")
                     {
                         app.terminal_commands[pos].status = status;
-                    } else if let Some(pos) = app
-                        .terminal_commands
-                        .iter()
-                        .rposition(|cmd| cmd.status == "Running")
-                    {
+                    } else if let Some(pos) = app.latest_running_cli_command() {
                         // fallback: update most recent Running entry when
                         // command strings differ (e.g. CommandStarted vs backend log)
                         app.terminal_commands[pos].status = status;
@@ -1881,11 +1897,7 @@ async fn main() -> Result<()> {
                 Event::CommandCompleted(tab, res) => {
                     match &res {
                         Ok(_) => {
-                            if let Some(pos) = app
-                                .terminal_commands
-                                .iter()
-                                .rposition(|cmd| cmd.status == "Running")
-                            {
+                            if let Some(pos) = app.latest_running_cli_command() {
                                 app.terminal_commands[pos].status = "Success".to_string();
                             }
                         }
@@ -3334,6 +3346,7 @@ async fn main() -> Result<()> {
                                                     );
                                                     app.config = crate::config::Config::load();
                                                     app.apply_config();
+                                                    app.load_custom_commands();
                                                     crate::config::reload_theme();
 
                                                     if let Ok(context) =
@@ -8269,6 +8282,12 @@ async fn main() -> Result<()> {
                             }
                             _ => {
                                 app.diff_view = Some(diff_view);
+                                handlers::custom_commands::run_bound_diff_command(
+                                    &mut app,
+                                    &key_event,
+                                    &mut terminal,
+                                    &events.sender(),
+                                );
                             }
                         }
                         continue;

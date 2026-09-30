@@ -123,6 +123,74 @@ pub fn matches_with_pending(
     keybinding_matches(binding, event)
 }
 
+/// The key event a single-key binding stands for, or `None` when the binding
+/// is not spelled in the grammar `keybinding_matches` accepts. Lets a binding
+/// be tested against other bindings without a real keypress.
+pub fn binding_key_event(binding: &str) -> Option<crossterm::event::KeyEvent> {
+    use crossterm::event::KeyEvent;
+    let named = match binding {
+        "Tab" => Some(KeyCode::Tab),
+        "Shift+Tab" => Some(KeyCode::BackTab),
+        "Enter" => Some(KeyCode::Enter),
+        "Esc" => Some(KeyCode::Esc),
+        "Backspace" => Some(KeyCode::Backspace),
+        "Space" => Some(KeyCode::Char(' ')),
+        "Up" => Some(KeyCode::Up),
+        "Down" => Some(KeyCode::Down),
+        "Left" => Some(KeyCode::Left),
+        "Right" => Some(KeyCode::Right),
+        "Home" => Some(KeyCode::Home),
+        "End" => Some(KeyCode::End),
+        "PageUp" => Some(KeyCode::PageUp),
+        "PageDown" => Some(KeyCode::PageDown),
+        _ => None,
+    };
+    if let Some(code) = named {
+        return Some(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    match binding {
+        "Ctrl+Enter" | "Ctrl+Return" => {
+            return Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        }
+        "Alt+Enter" | "Alt+Return" => {
+            return Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        }
+        _ => {}
+    }
+    if let Some(number) = binding.strip_prefix('F').filter(|n| n.len() <= 2) {
+        return number
+            .parse::<u8>()
+            .ok()
+            .map(|n| KeyEvent::new(KeyCode::F(n), KeyModifiers::NONE));
+    }
+    if let Some((modifier, key)) = binding.split_once('+').filter(|_| binding.len() > 1) {
+        let modifiers = match modifier {
+            "Ctrl" | "ctrl" | "CTRL" => KeyModifiers::CONTROL,
+            "Alt" | "alt" | "ALT" => KeyModifiers::ALT,
+            _ => return None,
+        };
+        let mut chars = key.chars();
+        return match (chars.next(), chars.next()) {
+            (Some(c), None)
+                if c.is_ascii_alphabetic() || (modifiers == KeyModifiers::ALT && c.is_ascii()) =>
+            {
+                Some(KeyEvent::new(
+                    KeyCode::Char(c.to_ascii_lowercase()),
+                    modifiers,
+                ))
+            }
+            _ => None,
+        };
+    }
+    let mut chars = binding.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii() => {
+            Some(KeyEvent::new(KeyCode::Char(c), expected_modifiers(c)))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::keybinding_matches;
@@ -245,5 +313,53 @@ mod tests {
         assert!(!keybinding_matches("", &event_shift));
         let event_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert!(!keybinding_matches("", &event_enter));
+    }
+
+    /// Every spelling the parser accepts must produce an event its own
+    /// binding matches, or a key could be accepted in config and never fire.
+    #[test]
+    fn binding_key_event_round_trips_through_keybinding_matches() {
+        for binding in [
+            "a",
+            "W",
+            "+",
+            "?",
+            "Space",
+            "Enter",
+            "Esc",
+            "Tab",
+            "Shift+Tab",
+            "Backspace",
+            "Up",
+            "PageDown",
+            "Home",
+            "F1",
+            "F12",
+            "Ctrl+g",
+            "ctrl+G",
+            "CTRL+x",
+            "Alt+x",
+            "Alt+1",
+            "Ctrl+Enter",
+            "Alt+Return",
+        ] {
+            let event = super::binding_key_event(binding)
+                .unwrap_or_else(|| panic!("{binding:?} should parse"));
+            assert!(
+                keybinding_matches(binding, &event),
+                "{binding:?} does not match its own event {event:?}"
+            );
+        }
+    }
+
+    /// Spellings `keybinding_matches` can never match are rejected, so they
+    /// are reported instead of silently doing nothing.
+    #[test]
+    fn binding_key_event_rejects_spellings_that_never_match() {
+        for binding in [
+            "", "gg", "F", "F100", "Ctrl+1", "Ctrl+ab", "Shift+a", "Meta+x", "é", "Alt+é", "enter",
+        ] {
+            assert_eq!(super::binding_key_event(binding), None, "{binding:?}");
+        }
     }
 }
