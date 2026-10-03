@@ -2267,9 +2267,10 @@ page_size = 250
     }
 
     /// A global file written for gh-dash (`prs`) and a repo-local file using
-    /// `mrs` must merge like any other table instead of failing the config.
+    /// `mrs` name the same pane, so the repo-local table replaces the global
+    /// one like any other table instead of failing the config.
     #[test]
-    fn prs_and_mrs_tables_from_two_files_merge_as_one_pane() {
+    fn local_mrs_table_replaces_global_prs_table() {
         let mut global: toml::Value = toml::from_str(
             "theme_preset = \"nord\"\n[[custom_keybindings.prs]]\nkey = \"w\"\ncommand = \"global\"\n",
         )
