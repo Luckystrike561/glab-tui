@@ -195,6 +195,7 @@ fn diff_view_action(config: &Config, event: &KeyEvent) -> Option<String> {
         KeyCode::Char('/' | 'f') => "search",
         KeyCode::Char('v' | 'V') => "select lines",
         KeyCode::Char('a' | 'c' | 'C' | 'r' | 'e') => "comments",
+        KeyCode::Char('T') => "review threads",
         _ => return None,
     };
     Some(format!(
@@ -1044,6 +1045,19 @@ command = "true"
                 .collect::<Vec<_>>(),
             vec!["Ctrl+o"]
         );
+    }
+
+    #[test]
+    fn diff_binding_on_review_threads_key_is_dropped() {
+        let config = config_with("[[diff]]\nkey = \"T\"\ncommand = \"true\"\n");
+        let (commands, problems) = CustomCommands::load(&config);
+
+        let reasons: Vec<&str> = problems.iter().map(|p| p.problem.as_str()).collect();
+        assert_eq!(
+            reasons,
+            vec!["never runs: the diff view's \"T\" (review threads) takes the key first"]
+        );
+        assert_eq!(commands.in_diff().count(), 0);
     }
 
     /// The documented example must load cleanly with the default built-in
