@@ -7,13 +7,15 @@ use ratatui::text::{Line, Span};
 
 use crate::app::highlight_line_syntax;
 use crate::config::Theme;
+use crate::utils::format::sanitize_untrusted;
 
 pub fn render_markdown(markdown: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let options = Options::ENABLE_GFM
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_TABLES;
-    MarkdownRenderer::new(theme, width).render(Parser::new_ext(markdown, options))
+    let markdown = sanitize_untrusted(markdown);
+    MarkdownRenderer::new(theme, width).render(Parser::new_ext(&markdown, options))
 }
 
 fn decode_html_entities(s: &str) -> String {
@@ -741,6 +743,17 @@ mod tests {
 
     fn render_markdown_for_test(markdown: &str) -> Vec<Line<'static>> {
         render_markdown(markdown, &Theme::default(), 80u16)
+    }
+
+    #[test]
+    fn render_markdown_strips_ansi_escapes() {
+        let md =
+            "Fix \u{1b}[31m**crash**\u{1b}[0m in \u{1b}]8;;https://x\u{07}`parser`\u{1b}]8;;\u{07}";
+        let text: Vec<String> = render_markdown_for_test(md)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(text, vec!["Fix crash in parser"]);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::config::{Icons, THEME, Theme};
-use crate::utils::format::truncate;
+use crate::utils::format::{sanitize_untrusted, truncate};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use std::collections::HashMap;
@@ -370,7 +370,7 @@ pub(crate) fn append_stage_summaries(
         };
         text.push(Line::from(vec![
             Span::styled(
-                format!("{:15} ", truncate(&s.name, 15)),
+                format!("{:15} ", truncate(&sanitize_untrusted(&s.name), 15)),
                 Style::default().fg(THEME.read().unwrap().text_normal),
             ),
             Span::styled(" ❯ ", Style::default().fg(THEME.read().unwrap().text_muted)),
@@ -393,7 +393,7 @@ pub(crate) fn append_job_summaries(
     jobs: &[crate::domain::pipelines::Job],
 ) {
     for job in jobs {
-        let name = job.name().to_string();
+        let name = sanitize_untrusted(job.name());
         let status = job.status().to_string();
         let status_color = match status.as_str() {
             "success" => THEME.read().unwrap().green,
@@ -590,6 +590,8 @@ pub(crate) fn render_fuzzy_cell(
             .bg(THEME.read().unwrap().highlight_bg)
             .add_modifier(Modifier::BOLD);
     }
+    let sanitized = sanitize_untrusted(text);
+    let text = sanitized.as_ref();
     let line = if query.trim().is_empty() {
         Line::from(text.to_string()).alignment(alignment)
     } else {

@@ -1,4 +1,5 @@
 use crate::config::THEME;
+use crate::utils::format::sanitize_untrusted;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -57,7 +58,7 @@ pub(crate) fn format_comment_with_suggestions(
         }
     }
 
-    for body_line in body.lines() {
+    for body_line in sanitize_untrusted(body).lines() {
         let is_suggestion_start = body_line.trim().starts_with("```suggestion");
         let is_suggestion_end = in_suggestion && body_line.trim().starts_with("```");
 

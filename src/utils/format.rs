@@ -1,3 +1,7 @@
+use std::borrow::Cow;
+use std::iter::Peekable;
+use std::str::Chars;
+
 use chrono::{DateTime, Utc};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -188,39 +192,80 @@ pub fn parse_mr_title_prefix(title: &str) -> (String, String) {
     (String::new(), extract_quotes(title_trimmed))
 }
 
+/// Text from GitLab/GitHub (titles, descriptions, comments, job names) is
+/// authored by third parties. Returns it unchanged when it holds no control
+/// characters, so the common case costs one scan and no allocation.
+pub fn sanitize_untrusted(s: &str) -> Cow<'_, str> {
+    if s.chars().any(is_stripped_control) {
+        Cow::Owned(strip_ansi_escapes(s))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// Removes ECMA-48 escape sequences (CSI, OSC, DCS/SOS/PM/APC strings and
+/// short escapes, in 7-bit `ESC x` and 8-bit C1 form) and every remaining
+/// control character except `\n`, `\r` and `\t`.
 pub fn strip_ansi_escapes(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            if let Some(&next_c) = chars.peek() {
-                if next_c == '[' {
-                    chars.next();
-                    for seq_c in chars.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&seq_c) {
-                            break;
-                        }
-                    }
-                } else if next_c == ']' {
-                    chars.next();
-                    while let Some(seq_c) = chars.next() {
-                        if seq_c == '\x07' {
-                            break;
-                        }
-                        if seq_c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                } else if ('\u{40}'..='\u{5f}').contains(&next_c) {
-                    chars.next();
-                }
+        let introducer = match c {
+            '\u{1b}' => skip_escape_prefix(&mut chars),
+            // C1 controls are the 8-bit spelling of `ESC` + (byte - 0x40).
+            '\u{80}'..='\u{9f}' => char::from_u32(c as u32 - 0x40),
+            _ if is_stripped_control(c) => None,
+            _ => {
+                result.push(c);
+                continue;
             }
-        } else {
-            result.push(c);
+        };
+        match introducer {
+            Some('[') => skip_csi_body(&mut chars),
+            Some(']' | 'P' | 'X' | '^' | '_') => skip_control_string(&mut chars),
+            _ => {}
         }
     }
     result
+}
+
+fn is_stripped_control(c: char) -> bool {
+    c.is_control() && !matches!(c, '\n' | '\r' | '\t')
+}
+
+/// Consumes what follows an `ESC`: intermediates (0x20–0x2F) and the final
+/// byte (0x30–0x7E). Returns the final byte when it introduces a C1 control
+/// (0x40–0x5F) whose body still needs skipping.
+fn skip_escape_prefix(chars: &mut Peekable<Chars<'_>>) -> Option<char> {
+    while chars
+        .next_if(|c| ('\u{20}'..='\u{2f}').contains(c))
+        .is_some()
+    {}
+    let last = chars.next_if(|c| ('\u{30}'..='\u{7e}').contains(c))?;
+    ('\u{40}'..='\u{5f}').contains(&last).then_some(last)
+}
+
+/// Parameters and intermediates span 0x20–0x3F, the final byte 0x40–0x7E.
+/// Any other character ends the sequence and is kept, so a stray `ESC[`
+/// cannot swallow the text after it.
+fn skip_csi_body(chars: &mut Peekable<Chars<'_>>) {
+    while chars
+        .next_if(|c| ('\u{20}'..='\u{3f}').contains(c))
+        .is_some()
+    {}
+    chars.next_if(|c| ('\u{40}'..='\u{7e}').contains(c));
+}
+
+/// Strings end at BEL or ST (`ESC \` / U+009C). An unterminated one stops at
+/// the line break so the rest of the text stays readable.
+fn skip_control_string(chars: &mut Peekable<Chars<'_>>) {
+    while let Some(c) = chars.next_if(|&c| c != '\n') {
+        match c {
+            '\u{07}' | '\u{9c}' => return,
+            '\u{1b}' if chars.next_if_eq(&'\\').is_some() => return,
+            _ => {}
+        }
+    }
 }
 
 pub fn parse_ansi_trace(trace: &str, theme: &crate::config::Theme) -> Vec<Line<'static>> {
@@ -806,6 +851,39 @@ mod tests {
     fn test_strip_ansi_escapes_preserves_non_ascii() {
         let input = "\u{1b}[32m✓\u{1b}[0m src/lib.rs — 3 tests ✔";
         assert_eq!(strip_ansi_escapes(input), "✓ src/lib.rs — 3 tests ✔");
+    }
+
+    #[test]
+    fn strip_ansi_escapes_removes_c1_and_string_sequences() {
+        let input =
+            "\u{9b}31mred\u{9b}0m \u{1b}P1$r0m\u{1b}\\dcs \u{1b}_apc\u{07}done \u{1b}(Bcharset";
+        assert_eq!(strip_ansi_escapes(input), "red dcs done charset");
+    }
+
+    #[test]
+    fn strip_ansi_escapes_keeps_text_after_malformed_sequences() {
+        assert_eq!(strip_ansi_escapes("a\u{1b}[\nb"), "a\nb");
+        assert_eq!(
+            strip_ansi_escapes("\u{1b}]8;;unterminated\nnext line"),
+            "\nnext line"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_escapes_drops_controls_but_keeps_whitespace() {
+        assert_eq!(
+            strip_ansi_escapes("a\u{07}b\u{08}c\u{7f}\r\n\td\u{0}"),
+            "abc\r\n\td"
+        );
+    }
+
+    #[test]
+    fn sanitize_untrusted_borrows_clean_text() {
+        assert!(matches!(
+            sanitize_untrusted("plain\r\n\ttitle ✓"),
+            Cow::Borrowed("plain\r\n\ttitle ✓")
+        ));
+        assert_eq!(sanitize_untrusted("\u{1b}[1mbold\u{1b}[0m"), "bold");
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use ratatui::{
@@ -12,7 +13,7 @@ use crate::app::{EditMenu, EntityDocument, Field, FieldTone, FieldType, Inspecto
 use crate::config::{ICONS, THEME, Theme};
 use crate::domain::issues::Issue;
 use crate::ui::helpers::{get_label_color, rendered_line_count};
-use crate::utils::format::parse_ansi_trace;
+use crate::utils::format::{parse_ansi_trace, sanitize_untrusted};
 use crate::utils::markdown::render_markdown;
 
 /// Map a `FieldTone` to the same `(fg, badge_bg, bold)` triple the table uses
@@ -62,7 +63,11 @@ pub(crate) fn render_entity_inspector(
     let (title, border_color, is_interactive) = match &mode {
         InspectorMode::Interactive { .. } => (
             if !doc.title.is_empty() {
-                format!(" {} {} ", icons.label_details, doc.title)
+                format!(
+                    " {} {} ",
+                    icons.label_details,
+                    sanitize_untrusted(&doc.title)
+                )
             } else {
                 format!(" {} Edit ", icons.label_details)
             },
@@ -71,7 +76,11 @@ pub(crate) fn render_entity_inspector(
         ),
         InspectorMode::ReadOnly { title_suffix, .. } => (
             if !doc.title.is_empty() {
-                format!(" {} Preview: {} ", icons.label_details, doc.title)
+                format!(
+                    " {} Preview: {} ",
+                    icons.label_details,
+                    sanitize_untrusted(&doc.title)
+                )
             } else if title_suffix.is_empty() {
                 format!(" {} Preview ", icons.label_details)
             } else {
@@ -488,8 +497,14 @@ pub(crate) fn build_field_list_items(
         })
         .map(|(i, f)| {
             let label = &f.label;
-            let val = &f.value;
             let is_selected = selected_idx == Some(i);
+            // The field being edited keeps its raw value so the cursor offset
+            // still indexes the string the user is typing into.
+            let sanitized_val = match sanitize_untrusted(&f.value) {
+                Cow::Owned(clean) if !(is_selected && editing) => Some(clean),
+                _ => None,
+            };
+            let val = sanitized_val.as_ref().unwrap_or(&f.value);
 
             if f.kind == FieldType::Section {
                 // Whitespace divider between field groups — no text, just a

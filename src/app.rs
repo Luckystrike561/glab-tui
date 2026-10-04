@@ -5,7 +5,7 @@ use crate::config::{Config, KeybindingConfig, THEME, Theme};
 use crate::domain::mr::{DiscussionNote, NotePosition};
 use crate::domain::review_threads::{ReviewThread, group_threads};
 use crate::domain::workflow_inputs::WorkflowInput;
-use crate::utils::format::expand_tabs;
+use crate::utils::format::{expand_tabs, strip_ansi_escapes};
 use crate::utils::ui::StatefulTable;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -1509,29 +1509,6 @@ fn expand_diff_line_tabs(line: &str) -> String {
         }
         _ => expand_tabs(line, DIFF_TAB_WIDTH),
     }
-}
-
-fn strip_ansi_escapes(input: &str) -> String {
-    let mut result = String::new();
-    let mut in_escape = false;
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            in_escape = true;
-            if let Some(&'[') = chars.peek() {
-                chars.next();
-            }
-            continue;
-        }
-        if in_escape {
-            if c.is_ascii_alphabetic() {
-                in_escape = false;
-            }
-            continue;
-        }
-        result.push(c);
-    }
-    result
 }
 
 impl DiffView {

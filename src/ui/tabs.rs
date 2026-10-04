@@ -1901,7 +1901,7 @@ pub(crate) fn render_tab_jobs(
                     text.push(Line::from(vec![
                         Span::styled("Name:     ", Style::default().fg(theme.text_muted)),
                         Span::styled(
-                            j.name().to_string(),
+                            crate::utils::format::sanitize_untrusted(j.name()).into_owned(),
                             Style::default()
                                 .fg(theme.text_normal)
                                 .add_modifier(Modifier::BOLD),

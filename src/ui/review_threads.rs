@@ -3,7 +3,7 @@ use super::modal::modal_area;
 use crate::app::{App, OverlayKind, ReviewThreadsOverview};
 use crate::config::{ICONS, THEME, Theme};
 use crate::domain::review_threads::{ReviewThread, ThreadAnchor};
-use crate::utils::format::{time_ago, truncate};
+use crate::utils::format::{sanitize_untrusted, time_ago, truncate};
 use crate::utils::markdown::render_markdown;
 use ratatui::{
     Frame,
@@ -109,7 +109,10 @@ fn thread_row(thread: &ReviewThread, theme: &Theme) -> Line<'static> {
         Style::default().fg(theme.blue),
     ));
     spans.push(Span::styled(
-        truncate(&root.body.replace('\n', " "), EXCERPT_CHARS),
+        truncate(
+            &sanitize_untrusted(&root.body).replace('\n', " "),
+            EXCERPT_CHARS,
+        ),
         Style::default().fg(theme.text_normal),
     ));
     if thread.reply_count() > 0 {
