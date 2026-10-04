@@ -753,6 +753,88 @@ mod related_issues_types {
     }
 }
 
+/// The REST review-comments endpoint carries no resolution state; only the
+/// GraphQL `reviewThreads` connection exposes `isResolved`. A comment's REST
+/// `id` is its GraphQL `databaseId`.
+fn review_thread_resolution_graphql_query(owner: &str, repo: &str, pr_number: u64) -> String {
+    let owner = owner.replace('\\', "\\\\").replace('"', "\\\"");
+    let repo = repo.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "{{ repository(owner:\"{owner}\",name:\"{repo}\") {{ pullRequest(number:{pr_number}) {{ \
+         reviewThreads(first:100) {{ nodes {{ isResolved \
+         comments(first:100) {{ nodes {{ databaseId }} }} }} }} }} }} }}"
+    )
+}
+
+/// Maps every review comment id to the resolution state of its thread.
+fn parse_review_thread_resolution(raw: &str) -> Result<HashMap<u64, bool>> {
+    use review_threads_types::*;
+    let resp: GhResponse = serde_json::from_str(raw)?;
+    if let Some(error) = resp.errors.first() {
+        anyhow::bail!("GraphQL error: {}", error.message);
+    }
+    let threads = resp
+        .data
+        .and_then(|d| d.repository)
+        .and_then(|r| r.pull_request)
+        .map(|pr| pr.review_threads.nodes)
+        .unwrap_or_default();
+    Ok(threads
+        .into_iter()
+        .flat_map(|thread| {
+            thread
+                .comments
+                .nodes
+                .into_iter()
+                .map(move |c| (c.database_id, thread.is_resolved))
+        })
+        .collect())
+}
+
+mod review_threads_types {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub(super) struct GhResponse {
+        pub(super) data: Option<GhData>,
+        #[serde(default)]
+        pub(super) errors: Vec<GhError>,
+    }
+    #[derive(Deserialize)]
+    pub(super) struct GhError {
+        pub(super) message: String,
+    }
+    #[derive(Deserialize)]
+    pub(super) struct GhData {
+        pub(super) repository: Option<GhRepo>,
+    }
+    #[derive(Deserialize)]
+    pub(super) struct GhRepo {
+        #[serde(rename = "pullRequest")]
+        pub(super) pull_request: Option<GhPr>,
+    }
+    #[derive(Deserialize)]
+    pub(super) struct GhPr {
+        #[serde(rename = "reviewThreads")]
+        pub(super) review_threads: GhConn<GhThread>,
+    }
+    #[derive(Deserialize)]
+    pub(super) struct GhConn<T> {
+        pub(super) nodes: Vec<T>,
+    }
+    #[derive(Deserialize)]
+    pub(super) struct GhThread {
+        #[serde(rename = "isResolved")]
+        pub(super) is_resolved: bool,
+        pub(super) comments: GhConn<GhComment>,
+    }
+    #[derive(Deserialize)]
+    pub(super) struct GhComment {
+        #[serde(rename = "databaseId")]
+        pub(super) database_id: u64,
+    }
+}
+
 #[async_trait]
 impl Backend for GhBackend {
     fn kind(&self) -> super::BackendKind {
@@ -1583,9 +1665,18 @@ impl Backend for GhBackend {
             "/repos/{}/pulls/{}/comments?per_page={}",
             project, mr_iid, page_size
         );
-        let raw = self
-            .raw_api(&endpoint, "GET", None, "Fetching MR Notes")
-            .await?;
+        let owner = project.split('/').next().unwrap_or(project);
+        let repo = project.split('/').nth(1).unwrap_or(project);
+        let query_arg = format!(
+            "query={}",
+            review_thread_resolution_graphql_query(owner, repo, mr_iid)
+        );
+        let graphql_args = ["api", "graphql", "-f", query_arg.as_str()];
+        let (raw, raw_threads) = tokio::try_join!(
+            self.raw_api(&endpoint, "GET", None, "Fetching MR Notes"),
+            self.run_gh(&graphql_args, "Fetching Review Threads"),
+        )?;
+        let resolution = parse_review_thread_resolution(&raw_threads)?;
 
         #[derive(Deserialize)]
         struct GhComment {
@@ -1634,6 +1725,7 @@ impl Backend for GhBackend {
                     .in_reply_to_id
                     .map(|rid| rid.to_string())
                     .unwrap_or_else(|| gc.id.to_string());
+                let resolved = resolution.get(&gc.id).copied();
                 DiscussionNote {
                     id: gc.id,
                     body: gc.body,
@@ -1642,8 +1734,10 @@ impl Backend for GhBackend {
                     system: false,
                     position,
                     discussion_id: Some(disc_id),
-                    resolved: Some(false),
-                    resolvable: Some(true),
+                    resolved,
+                    // Past the first 100 threads the state is unknown; such a
+                    // comment is shown as a plain note rather than as open.
+                    resolvable: Some(resolved.is_some()),
                 }
             })
             .collect())
@@ -4028,6 +4122,26 @@ mod tests {
         assert_eq!(s102.position, 2);
 
         assert!(stacks.get(&103).is_none());
+    }
+
+    #[test]
+    fn review_thread_resolution_maps_every_comment_to_its_thread_state() {
+        let raw = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+            {"isResolved":true,"comments":{"nodes":[{"databaseId":11},{"databaseId":12}]}},
+            {"isResolved":false,"comments":{"nodes":[{"databaseId":21}]}}
+        ]}}}}}"#;
+        let map = parse_review_thread_resolution(raw).unwrap();
+        assert_eq!(map.get(&11), Some(&true));
+        assert_eq!(map.get(&12), Some(&true));
+        assert_eq!(map.get(&21), Some(&false));
+        assert_eq!(map.get(&99), None);
+    }
+
+    #[test]
+    fn review_thread_resolution_graphql_errors_are_errors() {
+        let raw = r#"{"data":null,"errors":[{"message":"Could not resolve to a Repository"}]}"#;
+        let err = parse_review_thread_resolution(raw).unwrap_err();
+        assert!(err.to_string().contains("Could not resolve"));
     }
 
     #[test]
